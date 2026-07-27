@@ -1981,6 +1981,118 @@ def inspect_workbook9(path: Path):
     return tabs
 
 
+# A compound account string:  "<name> - <xxxxNNNN> (<4-char code>)"
+COMPOUND_RE = re.compile(r"^(.*?) - (\S+) \(([^)]+)\)\s*$")
+
+
+def _tab_rows(wb, title):
+    """Yield (col_index_by_lowername, row_tuple) for each data row of a tab,
+    using the clamped header."""
+    ws = wb[title]
+    it = ws.iter_rows(values_only=True)
+    row1 = list(next(it, ()) or [])
+    width = used_width(row1)
+    idx = {_clean(v).lower(): i for i, v in enumerate(row1[:width]) if _clean(v)}
+    for r in it:
+        yield idx, r
+
+
+def _val(idx, r, name):
+    i = idx.get(name.lower())
+    if i is None or i >= len(r) or r[i] is None:
+        return ""
+    return str(r[i]).strip()
+
+
+def harvest9(path: Path) -> dict:
+    """Harvest structural identifiers (no config) from the data tabs.
+    Returns sets: account_names, account_numbers, entity_codes, llc_names,
+    property_codes, addresses, compounds."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    acct_names, acct_nums, codes = set(), set(), set()
+    llcs, props, addrs, compounds = set(), set(), set(), set()
+
+    def add_compound(s):
+        if not s:
+            return
+        compounds.add(s)
+        m = COMPOUND_RE.match(s)
+        if m:
+            nm, num, code = (g.strip() for g in m.groups())
+            if nm:
+                acct_names.add(nm)
+            if num:
+                acct_nums.add(num)
+            if code:
+                codes.add(code)
+
+    present = set(wb.sheetnames)
+    if "accounts" in present:
+        for idx, r in _tab_rows(wb, "accounts"):
+            acct_names.add(_val(idx, r, "Account")) if _val(idx, r, "Account") else None
+            acct_nums.add(_val(idx, r, "Account #")) if _val(idx, r, "Account #") else None
+            llcs.add(_val(idx, r, "LLC")) if _val(idx, r, "LLC") else None
+            add_compound(_val(idx, r, "Unique Account Identifier"))
+            add_compound(_val(idx, r, "Sorted Accounts"))
+    if "LLCs" in present:
+        for idx, r in _tab_rows(wb, "LLCs"):
+            addrs.add(_val(idx, r, "Address")) if _val(idx, r, "Address") else None
+            llcs.add(_val(idx, r, "LLC")) if _val(idx, r, "LLC") else None
+            props.add(_val(idx, r, "Prop")) if _val(idx, r, "Prop") else None
+            for b in ("bank1", "bank2", "bank3"):
+                if _val(idx, r, b):
+                    acct_nums.add(_val(idx, r, b))
+    # Account / Account # / Prop also appear on the transaction-style tabs.
+    for tab in ("Transactions", "RulesN"):
+        if tab in present:
+            for idx, r in _tab_rows(wb, tab):
+                acct_names.add(_val(idx, r, "Account")) if _val(idx, r, "Account") else None
+                acct_nums.add(_val(idx, r, "Account #")) if _val(idx, r, "Account #") else None
+                props.add(_val(idx, r, "Prop")) if _val(idx, r, "Prop") else None
+    wb.close()
+    return {
+        "account_names": acct_names - {""}, "account_numbers": acct_nums - {""},
+        "entity_codes": codes - {""}, "llc_names": llcs - {""},
+        "property_codes": props - {""}, "addresses": addrs - {""},
+        "compounds": compounds - {""},
+    }
+
+
+def cmd_harvest9(args) -> int:
+    src: Path = args.workbook
+    if not src.exists():
+        print(f"ERROR: workbook not found: {src}", file=sys.stderr)
+        return 2
+    print("Draft 9 - increment 2: harvest structural identifiers + config inventory")
+    print(f"  workbook: {src}")
+    h = harvest9(src)
+
+    def show(label, values, n=12):
+        vals = sorted(values, key=str.lower)
+        print(f"\n{label}: {len(vals)} distinct")
+        for v in vals[:n]:
+            print(f"    {v!r}")
+        if len(vals) > n:
+            print(f"    ... (+{len(vals) - n} more)")
+
+    show("Account names (harvested)", h["account_names"])
+    show("Account numbers (harvested)", h["account_numbers"])
+    show("Entity/4-char codes (harvested)", h["entity_codes"])
+    show("LLC/entity names (harvested)", h["llc_names"])
+    show("Property codes (harvested)", h["property_codes"])
+    show("Addresses (harvested)", h["addresses"])
+    show("Compound account strings (harvested)", h["compounds"])
+
+    if args.config and args.config.exists():
+        cfg = load_config(args.config)
+        print("\nConfig CSV:")
+        for name in CONFIG_COLUMNS:
+            print(f"  {name}: {len(cfg[name]['distinct'])} distinct")
+
+    print("\nRESULT: PASS - distinct real-value inventory harvested (detection only; no mapping yet).")
+    return 0
+
+
 def cmd_wbinspect(args) -> int:
     src: Path = args.workbook
     if not src.exists():
@@ -2109,6 +2221,12 @@ def main(argv=None) -> int:
     wi.add_argument("-c", "--config", type=Path, default=None,
                     help="Config CSV (Names/Towns/Blacklist) to summarize")
     wi.set_defaults(func=cmd_wbinspect)
+
+    hv = sub.add_parser("harvest9", help="Draft 9 increment 2: harvest structural identifiers + inventory.")
+    hv.add_argument("workbook", type=Path, help="Master Excel workbook (.xlsx/.xlsm)")
+    hv.add_argument("-c", "--config", type=Path, default=None,
+                    help="Config CSV (Names/Towns/Blacklist) to summarize")
+    hv.set_defaults(func=cmd_harvest9)
 
     args = p.parse_args(argv)
     return args.func(args)
