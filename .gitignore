@@ -1,0 +1,24 @@
+# =====================================================================
+#  This folder contains REAL financial data. Default to ignoring
+#  EVERYTHING; explicitly permit ONLY the code / docs / bundled assets
+#  listed below. Anything not listed stays out of git — every workbook,
+#  CSV, TSV, mapping, output, and personal-data folder.
+# =====================================================================
+*
+
+# --- code & scripts ---
+!anonymizer.py
+!anonymize.ps1
+!RUN_ANONYMIZER.bat
+!RUN_BANKS_ONLY.bat
+
+# --- docs & templates (no personal data) ---
+!README.md
+!CLAUDE.md
+!Anonymization_Spec_Draft_9.docx
+!run.config.example.txt
+!.gitignore
+
+# --- bundled fake-value dictionaries (public, non-personal) ---
+!data/
+!data/**

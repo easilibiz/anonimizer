@@ -1,0 +1,23 @@
+# ============================================================
+#  Anonymizer settings (EXAMPLE / template) — the ONE config file.
+#  Copy to run.config.txt, edit the values, then double-click
+#  RUN_ANONYMIZER.bat (full) or RUN_BANKS_ONLY.bat (banks only).
+# ============================================================
+
+# Seed: any label. Blank = a new random seed each run.
+seed = seed1
+
+# Tab-delimited exports from Excel (Save As -> Text (Tab delimited)):
+transactions = Transactions.txt
+rules        = RuleN.txt
+
+# Names / Towns / Blacklist lists:
+config = anonimizer config.csv
+
+# Output folder (blank = .\output):
+output_dir =
+
+# Bank CSVs (optional). One 'bank =' line per file:
+#     bank = <file> | <account last-four, optional> | <description column>
+#bank = publicData\stmt (2).csv |  | Description
+#bank = publicData\Chase7352_Activity_20260725 sample.CSV | 7352 | Description
