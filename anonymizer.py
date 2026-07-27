@@ -1944,6 +1944,74 @@ def cmd_fromconfig(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Draft 9: folder-level Excel + CSV anonymizer (extends the TSV core above).
+# Reads the master workbook READ-ONLY (never rewrites it), one shared seed for
+# the whole folder. Increment 1 = load + no-op round-trip (this gates the rest).
+# --------------------------------------------------------------------------- #
+
+def used_width(row_values) -> int:
+    """Column count up to the last non-empty cell — clamps phantom columns
+    (RulesN reports 16k columns but really has ~17)."""
+    last = 0
+    for i, v in enumerate(row_values, start=1):
+        if v is not None and str(v).strip() != "":
+            last = i
+    return last
+
+
+def inspect_workbook9(path: Path):
+    """Open the workbook read-only and describe every sheet: state, reported vs
+    real (clamped) column count, header, and whether it's a data tab to process
+    (visible sheets) or skipped (hidden/veryHidden)."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    tabs = []
+    for ws in wb.worksheets:
+        row1 = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ()) or ())
+        width = used_width(row1)
+        tabs.append({
+            "title": ws.title,
+            "state": ws.sheet_state,               # visible / hidden / veryHidden
+            "reported_cols": ws.max_column or 0,
+            "used_cols": width,
+            "reported_rows": ws.max_row or 0,
+            "header": [_clean(v) for v in row1[:width]],
+            "processed": ws.sheet_state == "visible",
+        })
+    wb.close()
+    return tabs
+
+
+def cmd_wbinspect(args) -> int:
+    src: Path = args.workbook
+    if not src.exists():
+        print(f"ERROR: workbook not found: {src}", file=sys.stderr)
+        return 2
+    print("Draft 9 - increment 1: load workbook read-only; list data tabs; clamp columns")
+    print(f"  workbook: {src}")
+
+    tabs = inspect_workbook9(src)
+    print(f"\nSheets ({len(tabs)}):")
+    for t in tabs:
+        mark = "PROCESS" if t["processed"] else " skip  "
+        clamp = (f"cols {t['reported_cols']}->{t['used_cols']}"
+                 if t["reported_cols"] != t["used_cols"] else f"cols {t['used_cols']}")
+        print(f"  [{mark}] {t['title']!r:28} state={t['state']:10} rows~{t['reported_rows']:<6} {clamp}")
+        if t["processed"]:
+            print(f"            header: {t['header']}")
+
+    if args.config and args.config.exists():
+        cfg = load_config(args.config)
+        print("\nConfig CSV (Names / Towns / Blacklist):")
+        for name in CONFIG_COLUMNS:
+            print(f"  {name}: {len(cfg[name]['distinct'])} distinct")
+
+    processed = [t for t in tabs if t["processed"]]
+    print(f"\nRESULT: PASS - workbook opened read-only; {len(processed)} data tab(s) to process; "
+          "phantom columns clamped. (No mapping/replacement yet.)")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -2035,6 +2103,12 @@ def main(argv=None) -> int:
     fc.add_argument("--banks-only", action="store_true",
                     help="Anonymize only the bank CSVs listed in the settings file, reusing the mapping.")
     fc.set_defaults(func=cmd_fromconfig)
+
+    wi = sub.add_parser("wbinspect", help="Draft 9 increment 1: load workbook read-only, list/clamp data tabs.")
+    wi.add_argument("workbook", type=Path, help="Master Excel workbook (.xlsx/.xlsm)")
+    wi.add_argument("-c", "--config", type=Path, default=None,
+                    help="Config CSV (Names/Towns/Blacklist) to summarize")
+    wi.set_defaults(func=cmd_wbinspect)
 
     args = p.parse_args(argv)
     return args.func(args)
