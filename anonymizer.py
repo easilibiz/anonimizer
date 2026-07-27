@@ -586,11 +586,15 @@ def load_pools(data_dir: Path = DATA_DIR) -> dict:
         if not items:
             raise ValueError(f"Pool file is empty: {p}")
         return items
-    return {
+    pools = {
         "first_names": read("first_names.txt"),
         "surnames": read("surnames.txt"),
         "towns": read("towns_pool.txt"),
     }
+    streets = data_dir / "streets.txt"
+    if streets.exists():                       # optional (Draft 9 address rule)
+        pools["streets"] = [ln.strip() for ln in open(streets, encoding="utf-8") if ln.strip()]
+    return pools
 
 
 def _account_suffix(account_name: str) -> str:
@@ -2093,6 +2097,182 @@ def cmd_harvest9(args) -> int:
     return 0
 
 
+MAPPINGS9_DIR = Path(__file__).resolve().parent / "mappings"   # per-seed: mappings/<seed>/
+
+
+def parse_address(addr: str):
+    """Split 'street, city, ST ZIP' into (street, city, state, zip). Tolerant of
+    the two comma styles seen ('..., NJ, 07026' and '..., NJ 07047')."""
+    parts = [p.strip() for p in addr.split(",") if p.strip()]
+    street = parts[0] if parts else ""
+    city = parts[1] if len(parts) > 1 else ""
+    z = re.search(r"\b(\d{5})\b", addr)
+    st = re.search(r"\b([A-Za-z]{2})\b(?=[,\s]*\d{5})", addr) or re.search(r",\s*([A-Za-z]{2})\b", addr)
+    return street, city, (st.group(1) if st else ""), (z.group(1) if z else "")
+
+
+def build_mapping9(harvest: dict, config: dict, pools: dict, seed) -> dict:
+    """One deterministic, seed-driven, BIJECTIVE mapping across every category.
+    A single global `used` set guarantees distinct reals -> distinct fakes so the
+    LLC key joins survive. Names/LLCs are case-insensitive (one fake per value)."""
+    rng = random.Random(seed)
+    used = set()
+
+    cfg_names = set(config["Names"]["distinct"])
+    cfg_towns = set(config["Towns"]["distinct"])
+    cfg_black = set(config["Blacklist"]["distinct"])
+
+    # Forbid fakes that equal or CONTAIN any real root (so the blacklist scan
+    # can't be tripped by a pool word like the surname "Michael").
+    forbidden_words = (cfg_black | cfg_names | cfg_towns
+                       | harvest["account_names"] | harvest["llc_names"])
+    fw = _alt(sorted(w for w in forbidden_words if w))
+    forbid_rx = re.compile(rf"(?<!\w){fw}(?!\w)", re.IGNORECASE) if fw else None
+
+    def contains_forbidden(t):
+        return bool(forbid_rx and forbid_rx.search(t))
+
+    all_reals = (cfg_names | cfg_towns | harvest["account_names"] | harvest["llc_names"]
+                 | harvest["property_codes"] | harvest["entity_codes"] | harvest["addresses"])
+
+    def draw(make, reject=None):
+        for _ in range(10000):
+            c = make()
+            if c and c not in used and c not in all_reals and not (reject and reject(c)):
+                used.add(c)
+                return c
+        raise RuntimeError("could not draw a unique fake; pool too small?")
+
+    def fake_person():
+        return f"{rng.choice(pools['first_names'])} {rng.choice(pools['surnames'])}"
+
+    def fake_single():
+        return rng.choice(pools["first_names"])
+
+    def unique_code(real):
+        for salt in range(10000):
+            cand = fake_alnum(f"{seed}:{salt}" if salt else seed, real)
+            if cand != real and cand not in used:
+                used.add(cand)
+                return cand
+        raise RuntimeError("code space exhausted")
+
+    # --- Names (config + harvested account/LLC names), case-insensitive ---
+    names = {}
+    name_reals = {}
+    for r in sorted(cfg_names | harvest["account_names"] | harvest["llc_names"]):
+        name_reals.setdefault(r.lower(), r)   # sorted -> deterministic representative
+    for low in sorted(name_reals):
+        parts = name_reals[low].split()
+        suffix = parts[-1] if parts and parts[-1].upper().strip(".,") in ACCOUNT_TYPE_WORDS else ""
+        core = parts[:-1] if suffix else parts
+
+        def make(core=core, suffix=suffix):
+            base = fake_single() if len(core) <= 1 else fake_person()
+            return f"{base} {suffix}".strip() if suffix else base
+        names[low] = draw(make, reject=contains_forbidden)
+
+    # --- Towns (config) ---
+    towns = {}
+    for r in sorted(cfg_towns):
+        towns[r.lower()] = draw(lambda: rng.choice(pools["towns"]), reject=contains_forbidden)
+
+    # --- Account numbers, keyed on last-four ---
+    accounts, last_four = [], {}
+    by_key = {}
+    for num in harvest["account_numbers"]:
+        by_key.setdefault(acct_key(num), set()).add(num)
+    for key in sorted(by_key):
+        flf = draw(lambda: f"{rng.randrange(10000):04d}")
+        for form in bare_forms(key):
+            last_four[form] = flf
+        accounts.append({"key": key, "real_forms": sorted(by_key[key]),
+                         "fake_last4": flf, "fake_number": "xxxx" + flf})
+
+    # --- Entity 4-char codes + property codes (shape-preserving, unique) ---
+    entity_codes = {c: unique_code(c) for c in sorted(harvest["entity_codes"])}
+    property_codes = {}
+    for r in sorted(harvest["property_codes"]):       # full sort -> deterministic
+        if r.lower() not in property_codes:
+            property_codes[r.lower()] = unique_code(r)
+
+    # --- Streets (from addresses) + addresses ---
+    streets, addresses = {}, {}
+    street_pool = pools.get("streets", ["Main St"])
+
+    def fake_street():
+        return f"{rng.randrange(1, 10000)} {rng.choice(street_pool)}"
+    for addr in sorted(harvest["addresses"]):
+        street, city, state, zipc = parse_address(addr)
+        if street and street.lower() not in streets:
+            streets[street.lower()] = draw(fake_street)
+        fstreet = streets.get(street.lower(), street)
+        fcity = towns.get(city.lower())
+        if city and fcity is None:                    # city not in config towns
+            fcity = draw(lambda: rng.choice(pools["towns"]))
+            towns[city.lower()] = fcity
+        addresses[addr] = ", ".join(x for x in
+                                    [fstreet, fcity or city, f"{state} {zipc}".strip()] if x)
+
+    return {
+        "seed": seed, "names": names, "towns": towns, "accounts": accounts,
+        "last_four": last_four, "entity_codes": entity_codes,
+        "property_codes": property_codes, "streets": streets, "addresses": addresses,
+    }
+
+
+def cmd_map9(args) -> int:
+    src: Path = args.workbook
+    if not src.exists():
+        print(f"ERROR: workbook not found: {src}", file=sys.stderr)
+        return 2
+    if not args.config or not args.config.exists():
+        print("ERROR: --config (Names/Towns/Blacklist CSV) is required.", file=sys.stderr)
+        return 2
+    print("Draft 9 - increment 3: build ONE deterministic bijective mapping")
+    print(f"  workbook: {src}\n  seed:     {args.seed}")
+
+    harvest = harvest9(src)
+    config = load_config(args.config)
+    pools = load_pools()
+    mapping = build_mapping9(harvest, config, pools, args.seed)
+
+    out = MAPPINGS9_DIR / str(args.seed) / "mapping.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write("\n")
+
+    # Counts + bijection check (all fakes distinct across every category).
+    cats = {"names": list(mapping["names"].values()),
+            "towns": list(mapping["towns"].values()),
+            "account numbers": [a["fake_number"] for a in mapping["accounts"]],
+            "entity codes": list(mapping["entity_codes"].values()),
+            "property codes": list(mapping["property_codes"].values()),
+            "streets": list(mapping["streets"].values()),
+            "addresses": list(mapping["addresses"].values())}
+    all_fakes = [f for v in cats.values() for f in v]
+    print(f"\n  mapping written: {out}")
+    for k, v in cats.items():
+        print(f"    {k:16s}: {len(v)}")
+    bij = len(all_fakes) == len(set(all_fakes))
+    print(f"\n  Bijection (all {len(all_fakes)} fakes distinct): {'OK' if bij else 'FAIL - collision!'}")
+
+    print("\n  Samples:")
+    for low, fake in list(mapping["names"].items())[:3]:
+        print(f"    name   {low!r} -> {fake!r}")
+    for a in mapping["accounts"][:2]:
+        print(f"    acct#  {a['real_forms']} -> {a['fake_number']!r}")
+    for r, f in list(mapping["property_codes"].items())[:2]:
+        print(f"    prop   {r!r} -> {f!r}")
+    for r, f in mapping["addresses"].items():
+        print(f"    addr   {r!r} -> {f!r}")
+
+    print("\nRESULT:", "PASS - deterministic bijective mapping built and written."
+          if bij else "FAIL - bijection collision (see above).")
+    return 0 if bij else 1
+
+
 def cmd_wbinspect(args) -> int:
     src: Path = args.workbook
     if not src.exists():
@@ -2227,6 +2407,13 @@ def main(argv=None) -> int:
     hv.add_argument("-c", "--config", type=Path, default=None,
                     help="Config CSV (Names/Towns/Blacklist) to summarize")
     hv.set_defaults(func=cmd_harvest9)
+
+    m9 = sub.add_parser("map9", help="Draft 9 increment 3: build the deterministic bijective mapping.")
+    m9.add_argument("workbook", type=Path, help="Master Excel workbook (.xlsx/.xlsm)")
+    m9.add_argument("-c", "--config", type=Path, required=True,
+                    help="Config CSV (Names/Towns/Blacklist)")
+    m9.add_argument("--seed", required=True, help="Seed (names the mapping folder)")
+    m9.set_defaults(func=cmd_map9)
 
     args = p.parse_args(argv)
     return args.func(args)
