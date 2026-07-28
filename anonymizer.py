@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import random
 import re
@@ -2273,6 +2274,174 @@ def cmd_map9(args) -> int:
     return 0 if bij else 1
 
 
+def build_replacer9(mapping: dict):
+    """Combined case-insensitive replacer for the Draft 9 mapping. Group order is
+    most-specific first (street phrases and account numbers before names, codes
+    before the generic scrubs). Returns (pattern, repl, stats)."""
+    seed = mapping.get("seed", "")
+    street_map = {r.lower(): f for r, f in mapping["streets"].items()}
+    name_map = dict(mapping["names"])                       # already lower-keyed
+    town_map = dict(mapping["towns"])
+    prop_map = dict(mapping["property_codes"])              # lower-keyed
+    ent_map = {k.lower(): v for k, v in mapping["entity_codes"].items()}
+    last4_map = dict(mapping["last_four"])
+    acctnum_map = {}
+    for a in mapping["accounts"]:
+        for form in a["real_forms"]:
+            if any(not c.isdigit() for c in form):          # xxxx#### form
+                acctnum_map[form.lower()] = a["fake_number"]
+
+    parts = []
+    def grp(gname, literals, pre=r"(?<!\w)", post=r"(?!\w)"):
+        body = _alt(literals)
+        if body:
+            parts.append(rf"(?P<{gname}>{pre}{body}{post})")
+    grp("street", list(street_map))
+    grp("acctnum", list(acctnum_map))
+    grp("name", list(name_map))
+    grp("town", list(town_map))
+    grp("propcode", list(prop_map), pre=r"(?<![A-Za-z0-9])", post=r"(?![A-Za-z0-9])")
+    grp("entcode", list(ent_map), pre=r"(?<![A-Za-z0-9])", post=r"(?![A-Za-z0-9])")
+    if last4_map:
+        l4 = "(?:" + "|".join(re.escape(k) for k in sorted(last4_map)) + ")"
+        parts.append(rf"(?P<last4>(?<![A-Za-z0-9]){l4}(?![A-Za-z0-9]))")
+    parts.append(r"(?P<run>(?<![A-Za-z0-9])\d{5,}(?![A-Za-z0-9]))")
+    parts.append(r"(?P<alcode>(?<![A-Za-z0-9])[A-Za-z0-9]{5,}(?![A-Za-z0-9]))")
+    pattern = re.compile("|".join(parts), re.IGNORECASE)
+
+    stats = {}
+
+    def repl(m):
+        kind = m.lastgroup
+        text = m.group()
+        low = text.lower()
+        if kind == "street":
+            out = street_map[low]
+        elif kind == "acctnum":
+            out = acctnum_map[low]
+        elif kind == "name":
+            out = name_map[low]
+        elif kind == "town":
+            out = town_map[low]
+        elif kind == "propcode":
+            out = prop_map[low]
+        elif kind == "entcode":
+            out = ent_map[low]
+        elif kind == "last4":
+            out = last4_map.get(text, text)
+        elif kind == "run":
+            rr = random.Random(f"{seed}|run|{text}")
+            out = "".join(str(rr.randrange(10)) for _ in text)
+        elif kind == "alcode":
+            if is_code(text):
+                out = fake_alnum(seed, text)
+            else:
+                out, kind = text, "alcode_skip"
+        else:
+            out = text
+        stats[kind] = stats.get(kind, 0) + 1
+        return out
+
+    return pattern, repl, stats
+
+
+def serialize_cell(v) -> str:
+    """Faithfully render a cell value for TSV output. Text is returned as-is
+    (the caller applies replacement); numbers and dates pass through by value."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v == int(v) else repr(v)
+    if isinstance(v, datetime.datetime):
+        if v.hour or v.minute or v.second:
+            return f"{v.month}/{v.day}/{v.year} {v.hour:02d}:{v.minute:02d}:{v.second:02d}"
+        return f"{v.month}/{v.day}/{v.year}"
+    if isinstance(v, datetime.date):
+        return f"{v.month}/{v.day}/{v.year}"
+    return str(v)
+
+
+def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path):
+    """Anonymize every visible data tab and write one tab-delimited .txt each to
+    out_dir. Only text cells are replaced; numbers/dates pass through by type."""
+    pattern, repl, stats = build_replacer9(mapping)
+    addr_map = mapping.get("addresses", {})
+    wb = openpyxl.load_workbook(wb_path, read_only=True, data_only=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for ws in wb.worksheets:
+        if ws.sheet_state != "visible":
+            continue
+        it = ws.iter_rows(values_only=True)
+        row1 = list(next(it, ()) or [])
+        width = used_width(row1)
+        if width == 0:
+            continue
+        header = [_clean(v).lower() for v in row1[:width]]
+        addr_i = header.index("address") if "address" in header else -1
+        out_rows = [[serialize_cell(v) for v in row1[:width]]]
+        n = 0
+        for r in it:
+            cells = list(r)[:width]
+            if not any(c is not None and str(c).strip() for c in cells):
+                continue
+            row = []
+            for ci, v in enumerate(cells):
+                if not isinstance(v, str):
+                    row.append(serialize_cell(v))
+                elif ci == addr_i:
+                    # Address cell: use the address mapping (keeps state/ZIP);
+                    # fall back to the regex if this exact address wasn't harvested.
+                    row.append(addr_map.get(v) or pattern.sub(repl, v))
+                else:
+                    row.append(pattern.sub(repl, v))
+            out_rows.append(row)
+            n += 1
+        out_path = out_dir / f"{ws.title}.txt"
+        with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f, delimiter="\t").writerows(out_rows)
+        written.append((ws.title, out_path, n))
+    wb.close()
+    return written, stats
+
+
+def cmd_apply9(args) -> int:
+    src: Path = args.workbook
+    if not src.exists() or not (args.config and args.config.exists()):
+        print("ERROR: workbook and --config are required and must exist.", file=sys.stderr)
+        return 2
+    print("Draft 9 - increment 4: case-insensitive replacement -> output/<seed>/")
+    print(f"  workbook: {src}\n  seed:     {args.seed}")
+
+    harvest = harvest9(src)
+    config = load_config(args.config)
+    pools = load_pools()
+    mapping = build_mapping9(harvest, config, pools, args.seed)
+    map_out = MAPPINGS9_DIR / str(args.seed) / "mapping.json"
+    map_out.parent.mkdir(parents=True, exist_ok=True)
+    with open(map_out, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write("\n")
+
+    out_dir = (args.out or (src.parent / "output")) / str(args.seed)
+    written, stats = apply_workbook9(src, mapping, out_dir)
+
+    print(f"\n  output folder: {out_dir}")
+    for title, path, n in written:
+        print(f"    {title}.txt: {n} data rows")
+    print("  replacements by rule:")
+    for k in ("street", "acctnum", "name", "town", "propcode", "entcode", "last4", "run", "alcode"):
+        if k in stats:
+            print(f"    {k:10s}: {stats[k]}")
+    print(f"  mapping: {map_out}  (re-identification key - keep private)")
+    print("\nRESULT: PASS - data tabs anonymized to output/<seed>/ (bank CSVs handled by the folder runner).")
+    return 0
+
+
 def cmd_wbinspect(args) -> int:
     src: Path = args.workbook
     if not src.exists():
@@ -2414,6 +2583,15 @@ def main(argv=None) -> int:
                     help="Config CSV (Names/Towns/Blacklist)")
     m9.add_argument("--seed", required=True, help="Seed (names the mapping folder)")
     m9.set_defaults(func=cmd_map9)
+
+    a9 = sub.add_parser("apply9", help="Draft 9 increment 4: replacement pass -> output/<seed>/.")
+    a9.add_argument("workbook", type=Path, help="Master Excel workbook (.xlsx/.xlsm)")
+    a9.add_argument("-c", "--config", type=Path, required=True,
+                    help="Config CSV (Names/Towns/Blacklist)")
+    a9.add_argument("--seed", required=True, help="Seed (names the output subfolder + mapping)")
+    a9.add_argument("-o", "--out", type=Path, default=None,
+                    help="Output base folder (default: <workbook dir>/output)")
+    a9.set_defaults(func=cmd_apply9)
 
     args = p.parse_args(argv)
     return args.func(args)
