@@ -2442,6 +2442,76 @@ def cmd_apply9(args) -> int:
     return 0
 
 
+def _workbook_text(path: Path) -> str:
+    """All text-cell content of the visible data tabs, joined — for the scan
+    self-test (the blacklist roots should appear in the source)."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    chunks = []
+    for ws in wb.worksheets:
+        if ws.sheet_state != "visible":
+            continue
+        it = ws.iter_rows(values_only=True)
+        width = used_width(list(next(it, ()) or []))
+        for r in it:
+            for v in list(r)[:width]:
+                if isinstance(v, str) and v.strip():
+                    chunks.append(v)
+    wb.close()
+    return "\n".join(chunks)
+
+
+def scan_blacklist9(out_dir: Path, terms):
+    """Case-insensitive, whitespace-trimmed WHOLE-WORD scan of every output file
+    (word boundaries avoid false positives like 'Amira' for the root 'Amir').
+    Returns leaks [(file, term, context)]."""
+    pats = [(t.strip(), re.compile(r"(?<!\w)" + re.escape(t.strip()) + r"(?!\w)", re.IGNORECASE))
+            for t in terms if t.strip()]
+    leaks = []
+    for f in sorted(out_dir.glob("*.txt")):
+        text = f.read_text(encoding="utf-8-sig", errors="replace")
+        for tt, rx in pats:
+            m = rx.search(text)
+            if m:
+                i = m.start()
+                ctx = text[max(0, i - 25):i + len(tt) + 25].replace("\n", " ").replace("\t", " ")
+                leaks.append((f.name, tt, ctx))
+    return leaks
+
+
+def cmd_scan9(args) -> int:
+    src: Path = args.workbook
+    if not (args.config and args.config.exists()):
+        print("ERROR: --config is required.", file=sys.stderr)
+        return 2
+    out_dir = (args.out or (src.parent / "output")) / str(args.seed)
+    if not out_dir.exists():
+        print(f"ERROR: output folder not found: {out_dir}\n  Run apply9 for this seed first.", file=sys.stderr)
+        return 2
+    print("Draft 9 - increment 5: blacklist leakage scan (case-insensitive, whole-word)")
+    print(f"  outputs:   {out_dir}")
+
+    config = load_config(args.config)
+    terms = config["Blacklist"]["distinct"]
+
+    # Self-test: the roots should be present in the SOURCE (or the scan is moot).
+    src_text = _workbook_text(src).lower() if src.exists() else ""
+    found_src = sum(1 for t in terms if t.strip() and t.strip().lower() in src_text)
+    print(f"  blacklist terms: {len([t for t in terms if t.strip()])}   "
+          f"present in source (self-test): {found_src}")
+
+    leaks = scan_blacklist9(out_dir, terms)
+    print(f"\n  leaks in output (must be 0): {len(leaks)}")
+    for fn, t, ctx in leaks[:40]:
+        print(f"    [{fn}] {t!r} in ...{ctx}...")
+    if len(leaks) > 40:
+        print(f"    ... and {len(leaks) - 40} more")
+
+    ok = len(leaks) == 0
+    print("\nRESULT:", "PASS - no blacklist root survives in any output."
+          if ok else "FAIL - blacklist leakage (see above).")
+    return 0 if ok else 1
+
+
 def cmd_wbinspect(args) -> int:
     src: Path = args.workbook
     if not src.exists():
@@ -2592,6 +2662,15 @@ def main(argv=None) -> int:
     a9.add_argument("-o", "--out", type=Path, default=None,
                     help="Output base folder (default: <workbook dir>/output)")
     a9.set_defaults(func=cmd_apply9)
+
+    s9 = sub.add_parser("scan9", help="Draft 9 increment 5: blacklist leakage scan over output/<seed>/.")
+    s9.add_argument("workbook", type=Path, help="Master Excel workbook (for the self-test)")
+    s9.add_argument("-c", "--config", type=Path, required=True,
+                    help="Config CSV (Names/Towns/Blacklist)")
+    s9.add_argument("--seed", required=True, help="Seed (locates output/<seed>/)")
+    s9.add_argument("-o", "--out", type=Path, default=None,
+                    help="Output base folder (default: <workbook dir>/output)")
+    s9.set_defaults(func=cmd_scan9)
 
     args = p.parse_args(argv)
     return args.func(args)
