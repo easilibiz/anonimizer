@@ -1,0 +1,47 @@
+# =====================================================================
+#  Anonymizer (Draft 9) settings  --  used by RUN_ANONYMIZER9.bat
+#  Format: key = value    ('#' starts a comment, blank lines ignored)
+#  Copy this file to  run9.config.txt  and edit the values.
+# =====================================================================
+
+# --- INPUT: pick ONE of the two modes below --------------------------
+#
+# MODE A - Folder mode (recommended): point at ONE folder and the tool
+# takes everything from it automatically -- the master workbook
+# (.xlsx/.xlsm) and every bank statement CSV inside, no file lists needed.
+# Excel lock files (~$...), the config CSV, and previous *_anon.* outputs
+# are skipped automatically. If the folder has 0 or 2+ workbooks, the
+# tool stops and tells you so you can add an explicit 'workbook =' line.
+input_dir = PersonalData
+
+# MODE B - Explicit files: comment out 'input_dir' above and list files
+# by hand instead.
+#   workbook = orig private booksrez trimed -mini.xlsx
+#   bank = publicData\stmt (2).csv |  | Description
+#   bank = publicData\Chase7352_Activity_20260725 sample.CSV |  | Description
+# ('bank =' is repeatable, one line per statement CSV. The third field is
+# the description column name, default "Description". The middle field
+# is unused for this runner.)
+
+# --- REQUIRED ---------------------------------------------------------
+# Names / Towns / Blacklist CSV.
+config = anonimizer config.csv
+
+# --- OPTIONAL -----------------------------------------------------------
+# Seed names the mapping + output folder. Leave BLANK to auto-generate a
+# fresh seed each run; set a value to reproduce a previous run byte-for-byte.
+seed = seed1
+
+# Output base folder. Blank = <workbook folder>\output.
+# Results land in  <output_dir>\<seed>\ .
+output_dir =
+
+# Amount factor (optional): scales EVERY dollar amount in the workbook and
+# bank CSVs by this factor - Transactions/RulesN.Amount, and each bank CSV's
+# Amount, Running Bal., and preamble summary lines (Beginning/Ending balance,
+# Total credits/debits). Must be between 0.80 and 1.20. Blank or 1.0 = off
+# (amounts pass through exactly, unscaled - the default). A CONSTANT factor
+# preserves every total and running-balance calculation, just uniformly
+# scaled, so the books still tie to each other (though no longer to the
+# original real cent amounts - that's the point).
+amount_factor =

@@ -10,15 +10,20 @@
 !anonymizer.py
 !anonymize.ps1
 !RUN_ANONYMIZER.bat
+!RUN_ANONYMIZER9.bat
 !RUN_BANKS_ONLY.bat
 
 # --- docs & templates (no personal data) ---
 !README.md
 !CLAUDE.md
 !Anonymization_Spec_Draft_9.docx
+!Anonymization_Spec_Draft_10.docx
 !run.config.example.txt
+!run9.config.example.txt
 !.gitignore
 
 # --- bundled fake-value dictionaries (public, non-personal) ---
+# Explicit .txt allowlist only (NOT a blanket !data/** — that previously
+# unignored real bank CSVs someone had dropped in data/older/).
 !data/
-!data/**
+!data/*.txt

@@ -1,18 +1,119 @@
 # Anonymizer
 
 Turns your real bookkeeping data into a shareable, anonymized copy. It reads
-tab-delimited exports (Transactions + rules) **and** bank-download CSVs,
-replaces the sensitive text (names, towns, account names/numbers, long codes,
-letter+digit reference codes) with consistent fakes, keeps every amount and date
-exactly as-is, and writes files that open cleanly in Excel.
+your master Excel workbook **and** bank-download CSVs, replaces the sensitive
+text (names, towns, LLC/entity names, account names/numbers, addresses, long
+codes, letter+digit reference codes) with consistent fakes, keeps every amount
+and date exactly as-is, and writes files that open cleanly in Excel.
 
 Everything is driven by a **seed**: the same seed always produces the same
-fakes, so the transactions, the rules, and every bank CSV line up with each
-other. Change the seed to make a different anonymized copy.
+fakes, so the workbook tabs and every bank CSV line up with each other. Change
+the seed to make a different anonymized copy.
+
+There are two generations of this tool in this folder:
+
+- **Draft 9 (current, recommended)** — point at your Excel workbook + a
+  folder of bank CSVs, get back one clean anonymized `.xlsx` + anonymized bank
+  CSVs, with a built-in PASS/FAIL safety report. See **"Draft 9 — folder-based
+  run"** below. Use `RUN_ANONYMIZER9.bat`.
+- **Legacy (tab-delimited TSV workflow)** — the original tool, built around
+  manually-exported `Transactions.txt` / `RuleN.txt`. Still here for
+  compatibility; documented in the rest of this file. Use `RUN_ANONYMIZER.bat`.
 
 ---
 
-## The two buttons (batch files)
+## Draft 9 — folder-based run (recommended)
+
+**One button, one folder.** Put your master workbook (`.xlsx`/`.xlsm`) and all
+your bank statement CSVs in one folder, point `run9.config.txt` at that folder,
+and double-click `RUN_ANONYMIZER9.bat`. You never list individual files.
+
+### Step by step
+
+1. **Put everything in one input folder** (e.g. `PersonalData\`): the master
+   workbook, plus every bank statement CSV you want anonymized alongside it.
+2. **Copy `run9.config.example.txt` to `run9.config.txt`** (if you don't
+   already have one) and set:
+   ```
+   input_dir = PersonalData
+   config    = anonimizer config.csv
+   seed      = seed1
+   output_dir = output
+   ```
+3. **Double-click `RUN_ANONYMIZER9.bat`.**
+4. **Read the report.** All three checks should say **PASS**.
+5. **Collect the results** from `output\<seed>\`.
+
+### What "take everything from the folder" means
+
+With `input_dir` set, the tool scans that folder (top level only) and
+automatically picks up:
+- **the workbook** — the one `.xlsx`/`.xlsm` file in the folder,
+- **every bank CSV** — every `.csv` file in the folder.
+
+It automatically **skips**: the `config` CSV itself, Excel lock files
+(`~$...`), and any file already produced by a previous run (`*_anon.*`) — so
+re-running on the same folder doesn't try to anonymize its own output.
+
+If the folder has **no** workbook, or **more than one**, the run stops and
+tells you — add an explicit `workbook = <file>` line to `run9.config.txt` to
+pick one instead of relying on discovery.
+
+> Prefer to list files by hand instead of pointing at a folder? Comment out
+> `input_dir` and use `workbook =` + `bank =` lines — see
+> `run9.config.example.txt` for both modes side by side.
+
+### Draft 9 outputs
+
+In `output\<seed>\`:
+- **One anonymized workbook**: `<original name>_anon.xlsx` — a plain workbook
+  with exactly the same tabs as the source (no formatting, no styling).
+  Amounts and dates are kept as real Excel numbers/dates, only text is faked.
+- **One anonymized CSV per bank statement**: `<bankfile>_anon.csv` — same
+  columns, only the description text replaced.
+
+The mapping (re-identification key) is written to
+`mappings\<seed>\mapping.json` — **keep it private**, same rule as the legacy
+tool (see "The mapping — keep it private" below).
+
+### Amount factor (optional)
+
+Set `amount_factor` in `run9.config.txt` to uniformly scale every dollar
+amount — `Transactions`/`RulesN`.Amount, and each bank CSV's Amount, Running
+Bal., and preamble summary lines (Beginning/Ending balance, Total
+credits/debits) — by one constant factor. Must be between `0.80` and `1.20`;
+blank or `1.0` = off (the default — amounts pass through exactly). A constant
+factor preserves every total and running-balance calculation, so the books
+still tie to each other — just no longer to the original real cent amounts,
+which is the point.
+
+### Draft 9 seeds
+
+Same rules as the legacy tool: same seed → identical output; blank seed → a
+fresh random one each run (printed as `seed: xxxxxx (auto-generated)`); a new
+seed name → a brand-new, independent set of fakes.
+
+### Draft 9 report
+
+| Check | Meaning |
+|---|---|
+| Blacklist scan (whole-word) | None of your `Blacklist` entries (from `anonimizer config.csv`) survived anywhere in the output, workbook or bank CSVs. |
+| Determinism | Re-running the same seed produces byte-identical mapping. |
+| Bijection | Every distinct real value maps to its own distinct fake (no accidental collisions). |
+
+If any check **FAIL**s, the reason and the offending value are printed above
+the report — do not share the output until it's clean.
+
+### One entity, one fake name
+
+An LLC/owner that appears in several forms — bare (`idanamir`), checking
+(`idanamir CK`), the LLC itself (`idanamir LLC`) — always maps to the **same**
+fake root, e.g. `Denise` / `Denise CK` / `Denise LLC`. This keeps joins across
+tabs intact after anonymization.
+
+---
+
+## Legacy tool — the two buttons (batch files)
 
 You run the tool by **double-clicking a `.bat` file**. There are two:
 

@@ -1,12 +1,12 @@
 # Anonymizer — build context
 
 Turns the founder's real bookkeeping data into a shareable, anonymized twin.
-Full requirements: see `Anonymization_Spec_Draft_9.docx` in this repo. Read it before writing code.
+Full requirements: see `Anonymization_Spec_Draft_10.docx` in this repo. Read it before writing code.
 
 ## Settled decisions — do NOT relitigate
 - **Language:** Python 3. Read Excel with **openpyxl** (read-only; never rewrite the .xlsx). Read/write CSVs and TSVs with the `csv` module.
 - **Input = one folder** (e.g. `PersonalData/`): the master Excel workbook + ~a dozen raw bank CSVs. Everything in the folder is anonymized in ONE run under ONE seed and ONE shared mapping, so all files stay mutually synchronized.
-- **Output = per-seed batch:** `output/<seedname>/` (e.g. `output/John.Seed/`) — one tab-delimited `.txt` per Excel data tab, plus one anonymized file per bank CSV. Inputs are read-only.
+- **Output = per-seed batch:** `output/<seedname>/` (e.g. `output/John.Seed/`) — ONE plain `.xlsx` workbook (one sheet per Excel data tab, no styling; a tab-delimited `.txt` per tab was tried first but broke Excel's own parser on some real exports), plus one anonymized file per bank CSV. Inputs are read-only. Amount/date cells are written as native Excel numbers/dates, not text. Output file NAMES are anonymized too (the same known real values — not the blanket digit-run/reference-code scrub — so an ordinary filename with no real identifier in it is left alone), since export filenames sometimes carry the real account number (e.g. `Chase7352_Activity_....CSV`).
 - **Data tabs only.** Process the identifier-bearing tabs (`Transactions`, `RulesN`, `accounts`, `LLCs`); skip hidden/`veryHidden` and formula/report tabs. **Clamp each tab to its real used column range** — `RulesN` reports 16,371 columns but has 17. Ignore phantom columns or the run explodes.
 - **Only text cells are replaced.** Numeric and date cells are identified by type and NEVER read for replacement or modified. Amounts and dates pass through exactly; books must tie to the cent.
 - **Case-insensitive matching is mandatory.** The data mixes forms (`danmir`/`Danmir`, `IdanAmir`/`idanamir`).
@@ -27,17 +27,21 @@ Full requirements: see `Anonymization_Spec_Draft_9.docx` in this repo. Read it b
 ## Replacement rules (one combined pass, no chaining)
 - **Names & towns:** matched anywhere in a string, **whole-word**, **case-insensitive**; consistent (same real → same fake everywhere).
 - **Account name + Account #:** a bound pair; the fake last-four also replaces the bare last-four as a **whole 4-digit token** inside descriptions/notes. Handles both `xxxx7705` and bare `7705`.
-- **Property codes:** fake = 2 digits + 3 letters derived from the property's fake street (matches the real convention, e.g. `G42VW` = 42 Van Winkle). Must be **unique** across properties (collision-redraw) so the key never merges two properties.
+- **Property codes:** fake = up to 3 digits from the property's fake street number, a hyphen, then 3 letters from the fake street name (e.g. `142 Maple Ave` → `142-MAP`; fewer than 3 digits uses what's present). Each real code maps to one such fake, **unique** across properties (collision-redraw), and that fake is the persistent replacement everywhere the real code appears (Transactions, notes, the `LLCs` key).
 - **Addresses:** street-and-number → fake street; city → replaced via the `Towns` list; state and ZIP left unchanged.
 - **5+ digit runs** in descriptions/notes → blanket-randomized. Known-value mappings win over the blanket scrub.
 - **Bijection:** distinct reals → distinct fakes (collision-redraw), so the `LLCs` key joins (address ↔ prop ↔ account ↔ LLC) stay valid.
 - **Institutions** (e.g. Chase) left as-is.
+- **Output file names:** anonymized with the SAME known real values as above (account numbers/last-four, names, towns, property/entity codes) — but NOT the blanket 5+ digit run scrub or the generic reference-code scramble, since those would wrongly nuke an ordinary filename that has no real identifier in it at all. Export filenames sometimes glue the real account number directly onto other text (e.g. `Chase7352_Activity_20260725.CSV`); the last-four match uses a digit-only boundary (not the usual alnum boundary) so it still catches that.
 
 ## The key tab
-`LLCs` (Address | LLC | Prop | bank1–3) is the relationship key. It is anonymized in the SAME run with the SAME mapping, so the anonymized key correctly describes the anonymized data.
+The relationship-key tab (Address | Prop | LLC | bank1–3) is found BY ITS COLUMNS, not a fixed name — the founder has already renamed it once (`LLCs` → `Properties`); hardcoding the name silently broke harvesting (empty addresses, ZIPs caught by the digit scrub, property codes decoupled from their real address) with nothing in the report to say why. It is anonymized in the SAME run with the SAME mapping, so the anonymized key correctly describes the anonymized data.
+
+## Amount factor (optional)
+`amount_factor` (config setting, default 1.0/off, range 0.80–1.20) uniformly scales every dollar amount — `Transactions`/`RulesN`.Amount, and each bank CSV's Amount, Running Bal., and preamble summary lines (Beginning/Ending balance, Total credits/debits) — by one constant, founder-chosen factor. This is an OPT-IN departure from "amounts pass through exactly": a constant multiplier preserves every total/running-balance relationship (the books still tie to each other), just no longer to the original real cent amounts. Values outside 0.80–1.20 are rejected.
 
 ## Outputs
-- `output/<seedname>/` — anonymized `.txt` per tab + anonymized bank CSVs
+- `output/<seedname>/` — ONE anonymized `.xlsx` workbook (one sheet per data tab) + anonymized bank CSVs; output file names are anonymized too
 - mapping table, local-only, namespaced per seed (`mappings/<seed>...`), never committed/shared
 - pass/fail report
 

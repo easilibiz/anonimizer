@@ -19,6 +19,7 @@ import json
 import random
 import re
 import secrets
+import shutil
 import sys
 from pathlib import Path
 
@@ -72,6 +73,16 @@ def fake_alnum(seed, code: str) -> str:
         else:
             out.append(c)
     return "".join(out)
+
+
+# Word boundary that treats underscore as a separator, unlike \w (which
+# includes '_'). Bookkeeping data glues two names together with an
+# underscore (e.g. 'Ofir_Tali'); a plain \w boundary treats that as ONE
+# word, so neither 'Ofir' nor 'Tali' would match inside it and both would
+# survive un-anonymized. Real Unicode letters/digits still correctly block
+# a partial match (e.g. 'Dom' won't wrongly match inside 'Domínguez').
+WORDISH_PRE = r"(?<!(?!_)\w)"
+WORDISH_POST = r"(?!(?!_)\w)"
 
 
 def bare_token_re(token: str) -> "re.Pattern":
@@ -208,8 +219,10 @@ def load_config(path: Path) -> dict:
     """
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.reader(f))
+        # Excel saves "CSV UTF-8" and plain "CSV" differently (utf-8-sig vs
+        # cp1252); a config hand-edited/re-saved in Excel can flip between
+        # them, so fall back the same way bank CSVs already do.
+        _enc, rows = read_csv_any(path)
     elif suffix in (".xlsx", ".xlsm"):
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         ws = wb.active
@@ -556,8 +569,10 @@ def cmd_extract(args) -> int:
 # Trailing account-type words preserved on fake account names so they read
 # naturally (e.g. "Michael Team CK" -> "<fake person> CK").
 ACCOUNT_TYPE_WORDS = {
-    "CK", "CHK", "CHECKING", "SAVINGS", "SAV", "LLC", "INC", "CORP", "CO",
-    "TRUST", "MGMT", "HOLDINGS", "OPS", "FUND", "ESCROW",
+    "CK", "CHK", "CHECKING", "CHECK", "SAVINGS", "SAV", "SV", "LLC", "INC",
+    "CORP", "CO", "TRUST", "MGMT", "HOLDINGS", "OPS", "FUND", "ESCROW",
+    # account-type / product roles (unambiguous banking terms, never surnames):
+    "BUS", "BUSINESS", "BIZ", "VISA", "CARD", "CC", "LOAN", "PAYPAL", "CREDIT",
 }
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -1726,15 +1741,64 @@ def leak_scanners_from_mapping(mapping, config):
     return word_rx, digit_rx
 
 
-def anonymize_bank_csv(in_path: Path, out_path: Path, pattern, repl, desc_col):
+MONEY_RE = re.compile(r"^\(?-?\$?[\d,]+\.\d{2}\)?$")
+
+AMOUNT_COLUMN_NAMES = {"amount", "running bal.", "running balance", "balance", "summary amt."}
+
+
+def parse_money(text: str):
+    """Parse a plain currency string ('24,120.66', '-113,871.10', '(45.02)')
+    to a float, or None if it isn't one (dates, descriptions, blanks)."""
+    t = text.strip()
+    if not t or not MONEY_RE.match(t):
+        return None
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()").lstrip("$").replace(",", "")
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def format_money(value: float, like: str) -> str:
+    """Format `value` as currency text, matching the thousands-comma style of
+    the original text `like` it's replacing."""
+    return f"{value:,.2f}" if "," in like else f"{value:.2f}"
+
+
+def scale_amount_cell(text: str, factor: float) -> str:
+    """Scale a currency cell by `factor`, preserving its formatting style.
+    Returns `text` unchanged if it doesn't parse as plain currency."""
+    v = parse_money(text)
+    if v is None:
+        return text
+    return format_money(round(v * factor, 2), text)
+
+
+def anonymize_bank_csv(in_path: Path, out_path: Path, pattern, repl, desc_col, amount_factor: float = 1.0):
     """Anonymize one bank CSV: find the real header, rewrite only the
     description column in data rows, keep every other column, drop empty padding
-    rows, pass any preamble through unchanged. Returns a summary dict."""
+    rows. If amount_factor != 1.0, also scale every dollar figure - the data
+    rows' Amount/Running Bal. columns by column, AND any preamble line (e.g.
+    'Beginning balance as of ...') by scanning for plain currency text, since
+    preamble layout isn't as predictable as the real header's. A constant
+    factor preserves all the totals/running-balance math, just uniformly
+    scaled. Returns a summary dict."""
     enc, rows = read_csv_any(in_path)
     hidx = find_header_row(rows, desc_col)
     header = rows[hidx]
     di = _ci_index(header, desc_col)
-    out = [r for r in rows[:hidx + 1]]           # preamble + header, verbatim
+    amount_is = [i for i, h in enumerate(header) if h.strip().lower() in AMOUNT_COLUMN_NAMES]
+
+    out = []
+    if amount_factor != 1.0:
+        for row in rows[:hidx]:                   # preamble: scan every cell
+            out.append([scale_amount_cell(c, amount_factor) for c in row])
+        out.append(list(header))                  # header row itself: verbatim
+    else:
+        out = [r for r in rows[:hidx + 1]]         # preamble + header, verbatim
+
     changed = kept = 0
     for row in rows[hidx + 1:]:
         if not any(c.strip() for c in row):
@@ -1745,6 +1809,10 @@ def anonymize_bank_csv(in_path: Path, out_path: Path, pattern, repl, desc_col):
             if new != nr[di]:
                 changed += 1
             nr[di] = new
+        if amount_factor != 1.0:
+            for ai in amount_is:
+                if ai < len(nr) and nr[ai].strip():
+                    nr[ai] = scale_amount_cell(nr[ai], amount_factor)
         out.append(nr)
         kept += 1
     write_csv_any(out_path, out, enc)
@@ -2009,13 +2077,36 @@ def _val(idx, r, name):
     return str(r[i]).strip()
 
 
+def _find_key_tab(wb):
+    """Find the relationship-key tab (Address | Prop | LLC | bank1-3) by its
+    COLUMNS, not a fixed name. The founder has already renamed it once
+    ('LLCs' -> 'Properties'); hardcoding the name means a future rename
+    silently harvests nothing - no error, just corrupted output (addresses
+    left unparsed, ZIPs caught by the generic digit scrub, property codes
+    decoupled from their real address) with nothing in the report to say why."""
+    needed = {"address", "prop", "llc"}
+    for ws in wb.worksheets:
+        if ws.sheet_state != "visible":
+            continue
+        row1 = next(ws.iter_rows(values_only=True), ())
+        header = {_clean(v).lower() for v in row1}
+        if needed <= header:
+            return ws.title
+    return None
+
+
 def harvest9(path: Path) -> dict:
     """Harvest structural identifiers (no config) from the data tabs.
     Returns sets: account_names, account_numbers, entity_codes, llc_names,
-    property_codes, addresses, compounds."""
+    property_codes, addresses, compounds; plus prop_addresses/llc_addresses
+    (dicts: property code / LLC name -> set of addresses it's paired with in
+    the key tab), used to derive the property-code and LLC-name fakes from
+    that property's own fake street."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     acct_names, acct_nums, codes = set(), set(), set()
     llcs, props, addrs, compounds = set(), set(), set(), set()
+    prop_addrs = {}
+    llc_addrs = {}
 
     def add_compound(s):
         if not s:
@@ -2039,11 +2130,22 @@ def harvest9(path: Path) -> dict:
             llcs.add(_val(idx, r, "LLC")) if _val(idx, r, "LLC") else None
             add_compound(_val(idx, r, "Unique Account Identifier"))
             add_compound(_val(idx, r, "Sorted Accounts"))
-    if "LLCs" in present:
-        for idx, r in _tab_rows(wb, "LLCs"):
-            addrs.add(_val(idx, r, "Address")) if _val(idx, r, "Address") else None
-            llcs.add(_val(idx, r, "LLC")) if _val(idx, r, "LLC") else None
-            props.add(_val(idx, r, "Prop")) if _val(idx, r, "Prop") else None
+    key_tab = _find_key_tab(wb)
+    if key_tab:
+        for idx, r in _tab_rows(wb, key_tab):
+            addr = _val(idx, r, "Address")
+            prop = _val(idx, r, "Prop")
+            if addr:
+                addrs.add(addr)
+            if prop:
+                props.add(prop)
+            if prop and addr:
+                prop_addrs.setdefault(prop.lower(), set()).add(addr)
+            llc = _val(idx, r, "LLC")
+            if llc:
+                llcs.add(llc)
+                if addr:
+                    llc_addrs.setdefault(llc.lower(), set()).add(addr)
             for b in ("bank1", "bank2", "bank3"):
                 if _val(idx, r, b):
                     acct_nums.add(_val(idx, r, b))
@@ -2059,7 +2161,8 @@ def harvest9(path: Path) -> dict:
         "account_names": acct_names - {""}, "account_numbers": acct_nums - {""},
         "entity_codes": codes - {""}, "llc_names": llcs - {""},
         "property_codes": props - {""}, "addresses": addrs - {""},
-        "compounds": compounds - {""},
+        "compounds": compounds - {""}, "prop_addresses": prop_addrs,
+        "llc_addresses": llc_addrs, "key_tab": key_tab,
     }
 
 
@@ -2128,7 +2231,7 @@ def build_mapping9(harvest: dict, config: dict, pools: dict, seed) -> dict:
     forbidden_words = (cfg_black | cfg_names | cfg_towns
                        | harvest["account_names"] | harvest["llc_names"])
     fw = _alt(sorted(w for w in forbidden_words if w))
-    forbid_rx = re.compile(rf"(?<!\w){fw}(?!\w)", re.IGNORECASE) if fw else None
+    forbid_rx = re.compile(rf"{WORDISH_PRE}{fw}{WORDISH_POST}", re.IGNORECASE) if fw else None
 
     def contains_forbidden(t):
         return bool(forbid_rx and forbid_rx.search(t))
@@ -2158,20 +2261,39 @@ def build_mapping9(harvest: dict, config: dict, pools: dict, seed) -> dict:
                 return cand
         raise RuntimeError("code space exhausted")
 
-    # --- Names (config + harvested account/LLC names), case-insensitive ---
+    # --- Names: ONLY the config's Names column, case-insensitive ---
+    # Account/LLC names harvested structurally (e.g. 'Realty Central CK',
+    # 'MR Business 3', 'Blue Cash Everyday') are NOT auto-faked just for
+    # appearing in the Account/LLC column - only the specific words the
+    # founder has actually listed in Names get replaced, everywhere they
+    # appear (Account column, LLC column, Transactions/notes text alike).
+    # A real entity root already in Names (e.g. 'Danmir') still correctly
+    # covers ALL its compound forms ('Danmir CK', 'Danmir LLC', 'Danmir Bus')
+    # via plain whole-word matching - the suffix is untouched literal text,
+    # so one config entry per root is enough; no separate harvesting needed.
     names = {}
     name_reals = {}
-    for r in sorted(cfg_names | harvest["account_names"] | harvest["llc_names"]):
+    for r in sorted(cfg_names):
         name_reals.setdefault(r.lower(), r)   # sorted -> deterministic representative
-    for low in sorted(name_reals):
-        parts = name_reals[low].split()
-        suffix = parts[-1] if parts and parts[-1].upper().strip(".,") in ACCOUNT_TYPE_WORDS else ""
-        core = parts[:-1] if suffix else parts
 
-        def make(core=core, suffix=suffix):
-            base = fake_single() if len(core) <= 1 else fake_person()
-            return f"{base} {suffix}".strip() if suffix else base
-        names[low] = draw(make, reject=contains_forbidden)
+    def split_core(real):
+        parts = real.split()
+        if len(parts) > 1 and parts[-1].upper().strip(".,") in ACCOUNT_TYPE_WORDS:
+            return parts[:-1], parts[-1]      # (core words, suffix word)
+        return parts, ""
+
+    core_fakes = {}                           # core (lowercased) -> shared fake base
+    def base_for(core):
+        key = " ".join(core).lower()
+        if key not in core_fakes:
+            maker = fake_single if len(core) <= 1 else fake_person
+            core_fakes[key] = draw(maker, reject=contains_forbidden)
+        return core_fakes[key]
+
+    for low in sorted(name_reals):
+        core, suffix = split_core(name_reals[low])
+        base = base_for(core)
+        names[low] = f"{base} {suffix}" if suffix else base
 
     # --- Towns (config) ---
     towns = {}
@@ -2190,19 +2312,18 @@ def build_mapping9(harvest: dict, config: dict, pools: dict, seed) -> dict:
         accounts.append({"key": key, "real_forms": sorted(by_key[key]),
                          "fake_last4": flf, "fake_number": "xxxx" + flf})
 
-    # --- Entity 4-char codes + property codes (shape-preserving, unique) ---
+    # --- Entity 4-char codes (shape-preserving, unique) ---
     entity_codes = {c: unique_code(c) for c in sorted(harvest["entity_codes"])}
-    property_codes = {}
-    for r in sorted(harvest["property_codes"]):       # full sort -> deterministic
-        if r.lower() not in property_codes:
-            property_codes[r.lower()] = unique_code(r)
 
     # --- Streets (from addresses) + addresses ---
+    # Street numbers are capped to 1-999 (1-3 digits): property codes are
+    # derived FROM these fake street numbers (see below) and must never need
+    # truncation - "up to 3 digits" is naturally satisfied by this range.
     streets, addresses = {}, {}
     street_pool = pools.get("streets", ["Main St"])
 
     def fake_street():
-        return f"{rng.randrange(1, 10000)} {rng.choice(street_pool)}"
+        return f"{rng.randrange(1, 1000)} {rng.choice(street_pool)}"
     for addr in sorted(harvest["addresses"]):
         street, city, state, zipc = parse_address(addr)
         if street and street.lower() not in streets:
@@ -2215,10 +2336,103 @@ def build_mapping9(harvest: dict, config: dict, pools: dict, seed) -> dict:
         addresses[addr] = ", ".join(x for x in
                                     [fstreet, fcity or city, f"{state} {zipc}".strip()] if x)
 
+    # --- Property codes: derived from the property's own fake street ---
+    # Fake = up to 3 digits from the fake street number + '-' + 3 letters
+    # from the fake street name (e.g. fake '142 Maple Ave' -> '142-MAP';
+    # fake '58 Oak Ln' -> '58-OAK'; a number under 3 digits is used as-is).
+    # Only values that actually LOOK like a property code (contain a digit,
+    # e.g. 'G42VW') are converted at all - the 'Prop' column also carries
+    # plain administrative labels ('Commo', 'UPDATE', 'FILL') that are left
+    # untouched. A stray real town/name with no digits is NOT caught here -
+    # add it to Names/Towns/Blacklist in the config if it needs protecting.
+    def prop_code_from_street(fake_street_text):
+        parts = fake_street_text.split(maxsplit=1)
+        number = parts[0] if parts else ""
+        name_word = parts[1].split()[0] if len(parts) > 1 and parts[1].split() else ""
+        digits = number[:3]
+        letters = "".join(c for c in name_word if c.isalpha())[:3].upper()
+        return f"{digits}-{letters}"
+
+    def synth_property_street(real_code):
+        # A property code with no linked Address in LLCs still needs a fake
+        # street to derive its code from; seeded on the real code itself so
+        # it's stable regardless of harvest order (never shown as a real
+        # address anywhere - it only exists to derive this one code).
+        r = random.Random(f"{seed}|propstreet|{real_code}")
+        return f"{r.randrange(1, 1000)} {r.choice(street_pool)}"
+
+    addr_for_prop = {p: sorted(a)[0] for p, a in harvest["prop_addresses"].items()}
+    property_codes = {}
+    for real in sorted(harvest["property_codes"]):     # full sort -> deterministic
+        low = real.lower()
+        if low in property_codes or not any(c.isdigit() for c in real):
+            continue
+        fstreet = None
+        addr = addr_for_prop.get(low)
+        if addr:
+            street, _city, _state, _zipc = parse_address(addr)
+            fstreet = streets.get(street.lower())
+        if not fstreet:
+            fstreet = synth_property_street(real)
+        candidate = prop_code_from_street(fstreet)
+        if candidate in used:
+            # Collision: two properties' fake streets produced the same
+            # NNN-LLL (e.g. '142 Maple' vs '142 Maplewood' both -> '142-MAP').
+            # Redraw a fresh, still street-shaped code deterministically tied
+            # to THIS real code, so the mapping stays reproducible.
+            for salt in range(1, 10000):
+                rr = random.Random(f"{seed}|propcode|{real}|{salt}")
+                candidate = (f"{rr.randrange(1, 1000)}-"
+                             f"{''.join(chr(65 + rr.randrange(26)) for _ in range(3))}")
+                if candidate not in used:
+                    break
+            else:
+                raise RuntimeError("property code space exhausted")
+        used.add(candidate)
+        property_codes[low] = candidate
+
+    # --- LLC names for property-owning entities: match the property's street.
+    # e.g. real 'Danmir LLC' (linked to '196 Central Ave') -> fake
+    # '280 Water St LLC', using that SAME property's already-generated fake
+    # street. Overrides the generic owner-root fake for this EXACT compound
+    # string only - the same owner's account nicknames (e.g. 'Danmir CK')
+    # still use the owner-root fake, since those are a different real-world
+    # reference, not this property-holding entity's registered name. An LLC
+    # tied to more than one address (data can have this) is named after the
+    # alphabetically-first one, for a reproducible, deterministic choice.
+    def synth_llc_street(real_name):
+        r = random.Random(f"{seed}|llcstreet|{real_name}")
+        return f"{r.randrange(1, 1000)} {r.choice(street_pool)}"
+
+    addr_for_llc = {n: sorted(a)[0] for n, a in harvest["llc_addresses"].items()}
+    llc_property_names = {}
+    for low in sorted(harvest["llc_addresses"]):       # full sort -> deterministic
+        fstreet = None
+        addr = addr_for_llc.get(low)
+        if addr:
+            street, _city, _state, _zipc = parse_address(addr)
+            fstreet = streets.get(street.lower())
+        if not fstreet:
+            fstreet = synth_llc_street(low)
+        candidate = f"{fstreet} LLC"
+        if candidate in used:
+            # Collision: two LLCs' fake streets produced the same name.
+            # Redraw, deterministically tied to THIS real LLC name.
+            for salt in range(1, 10000):
+                rr = random.Random(f"{seed}|llcname|{low}|{salt}")
+                candidate = f"{rr.randrange(1, 1000)} {rr.choice(street_pool)} LLC"
+                if candidate not in used:
+                    break
+            else:
+                raise RuntimeError("LLC-name space exhausted")
+        used.add(candidate)
+        llc_property_names[low] = candidate
+
     return {
         "seed": seed, "names": names, "towns": towns, "accounts": accounts,
         "last_four": last_four, "entity_codes": entity_codes,
         "property_codes": property_codes, "streets": streets, "addresses": addresses,
+        "llc_property_names": llc_property_names,
     }
 
 
@@ -2274,6 +2488,212 @@ def cmd_map9(args) -> int:
     return 0 if bij else 1
 
 
+def run9_batch(src: Path, config_path: Path, seed: str, bank_specs, out: Path = None,
+               auto_seed: bool = False, amount_factor: float = 1.0) -> int:
+    """Draft 9 increment 7 core: one seed -> workbook tabs + bank CSVs + checks.
+    bank_specs: list of (Path, desc_col). Shared by the CLI (run9) and the
+    config-file front-end (fromconfig9). amount_factor (0.80-1.20, default
+    1.0 = off) uniformly scales every dollar amount across the workbook and
+    bank CSVs - an OPT-IN extra layer of obfuscation on top of value mapping;
+    a constant factor preserves all totals/running-balance math."""
+    if not (0.80 <= amount_factor <= 1.20):
+        print(f"ERROR: amount_factor must be between 0.80 and 1.20 (got {amount_factor}).",
+              file=sys.stderr)
+        return 2
+    problems = []
+    if not src.exists():
+        problems.append(("workbook", src))
+    if not (config_path and config_path.exists()):
+        problems.append(("config", config_path))
+    problems += [("bank", p) for p, _c in bank_specs if not p.exists()]
+    if problems:
+        print("ERROR: cannot find the following file(s) - check the paths in the settings file:",
+              file=sys.stderr)
+        for label, p in problems:
+            print(f"  [{label}] {p}", file=sys.stderr)
+            parent = p.parent
+            if parent.exists():
+                near = sorted(x.name for x in parent.iterdir() if x.is_file())[:8]
+                print(f"          folder exists; it contains: {near}"
+                      + (" ..." if len(near) == 8 else ""), file=sys.stderr)
+            else:
+                print(f"          (that folder does not exist: {parent})", file=sys.stderr)
+        return 2
+
+    print("=" * 64)
+    print("ANONYMIZER RUN (Draft 9 - workbook + bank CSVs)")
+    print("=" * 64)
+    print(f"  workbook: {src}")
+    print(f"  banks:    {[p.name for p, _c in bank_specs] or '(none)'}")
+    print(f"  seed:     {seed}" + ("   (auto-generated)" if auto_seed else ""))
+    if amount_factor != 1.0:
+        print(f"  amount factor: {amount_factor}  (every dollar amount scaled by this factor)")
+
+    harvest = harvest9(src)
+    if not harvest.get("key_tab"):
+        print("  WARNING: no relationship-key tab found (need a visible tab with"
+              " Address + Prop + LLC columns). Addresses/property-code links will"
+              " be MISSING and any address text will NOT be properly anonymized -"
+              " check the workbook for a renamed or missing key tab.")
+    config = load_config(config_path)
+    pools = load_pools()
+    mapping = build_mapping9(harvest, config, pools, seed)
+    map_out = MAPPINGS9_DIR / str(seed) / "mapping.json"
+    map_out.parent.mkdir(parents=True, exist_ok=True)
+    with open(map_out, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write("\n")
+
+    out_dir = (out or (src.parent / "output")) / str(seed)
+    # Clear any files left from an earlier run under this seed (e.g. from a
+    # workbook/bank file that has since been renamed or removed) - otherwise
+    # the blacklist scan below would sweep them in and flag leaks that belong
+    # to old, no-longer-relevant output rather than this run's files.
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+
+    # Workbook tabs -> one plain .xlsx (four tabs).
+    written, wb_out, stats = apply_workbook9(src, mapping, out_dir, amount_factor=amount_factor)
+    print(f"\n  output: {out_dir}")
+    print(f"    {wb_out.name}  ({len(written)} tabs)")
+    for title, n in written:
+        print(f"      - {title}: {n} rows")
+
+    # Bank CSVs (same mapping/replacer; only the description column changes).
+    pattern, repl, _bs = build_replacer9(mapping)
+    for b, desc_col in bank_specs:
+        safe_stem = anonymize_filename_stem(b.stem, mapping)
+        out_name = f"{safe_stem}_anon{b.suffix}"
+        info = anonymize_bank_csv(b, out_dir / out_name, pattern, repl, desc_col,
+                                   amount_factor=amount_factor)
+        print(f"    {out_name}: {info['rows']} rows, "
+              f"{info['changed']} descriptions changed, header@row{info['header_row'] + 1}")
+    print(f"  mapping: {map_out}  (re-identification key - keep private)")
+
+    # Checks.
+    results = []
+    leaks = scan_blacklist9(out_dir, config["Blacklist"]["distinct"])
+    results.append((f"Blacklist scan (whole-word) - {len(leaks)} leak(s)", not leaks))
+    for fn, t, ctx in leaks[:10]:
+        print(f"    LEAK [{fn}] {t!r} in ...{ctx}...")
+
+    m2 = build_mapping9(harvest9(src), load_config(config_path), pools, seed)
+    det = json.dumps(m2, sort_keys=True) == json.dumps(mapping, sort_keys=True)
+    results.append(("Determinism (same seed -> identical mapping)", det))
+
+    all_fakes = ([a["fake_number"] for a in mapping["accounts"]]
+                 + list(mapping["names"].values()) + list(mapping["property_codes"].values())
+                 + list(mapping["entity_codes"].values()) + list(mapping["streets"].values()))
+    results.append(("Bijection (distinct reals -> distinct fakes)", len(all_fakes) == len(set(all_fakes))))
+
+    print("\n" + "-" * 64)
+    print("REPORT")
+    print("-" * 64)
+    ok = True
+    for label, passed in results:
+        print(f"  [{'PASS' if passed else 'FAIL'}]  {label}")
+        ok = ok and passed
+    print("-" * 64)
+    print("OVERALL:", "PASS - batch anonymized, safe to share." if ok
+          else "FAIL - do NOT share; see failures above.")
+    print("=" * 64)
+    return 0 if ok else 1
+
+
+def cmd_run9(args) -> int:
+    """Draft 9 increment 7 (CLI): master workbook + --banks CSVs under one seed."""
+    bank_specs = [(Path(b), "Description") for b in (args.banks or [])]
+    return run9_batch(args.workbook, args.config, args.seed, bank_specs, args.out,
+                       amount_factor=args.amount_factor)
+
+
+def cmd_fromconfig9(args) -> int:
+    """Draft 9 increment 7 (double-click front-end): read every setting from a
+    'key = value' file so the user never types the long command line."""
+    cfg_file: Path = args.file or (Path(__file__).resolve().parent / "run9.config.txt")
+    if not cfg_file.exists():
+        print(f"ERROR: settings file not found: {cfg_file}", file=sys.stderr)
+        print("Create it (see run9.config.example.txt): workbook, config, seed, bank = ...",
+              file=sys.stderr)
+        return 2
+    base = cfg_file.parent
+    s = parse_run_config(cfg_file)
+    print(f"Reading settings from: {cfg_file}\n")
+
+    if not s.get("config"):
+        print("ERROR: 'config' (Names/Towns/Blacklist CSV) is required in the settings file.", file=sys.stderr)
+        return 2
+    config_path = _resolve_path(base, s["config"])
+    seed = s.get("seed") or secrets.token_hex(3)
+    auto = not s.get("seed")
+    out = _resolve_path(base, s["output_dir"]) if s.get("output_dir") else None
+
+    amount_factor = 1.0
+    if s.get("amount_factor"):
+        try:
+            amount_factor = float(s["amount_factor"])
+        except ValueError:
+            print(f"ERROR: 'amount_factor' must be a number (got {s['amount_factor']!r}).",
+                  file=sys.stderr)
+            return 2
+
+    if s.get("input_dir"):
+        # --- Folder mode: point at ONE folder; take everything from it. ---
+        src, bank_specs, err = discover_inputs9(_resolve_path(base, s["input_dir"]), config_path)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
+        print(f"  input folder: {_resolve_path(base, s['input_dir'])}")
+        print(f"    workbook:  {src.name}")
+        print(f"    banks:     {[p.name for p, _c in bank_specs] or '(none found)'}\n")
+    else:
+        # --- Explicit-file mode: 'workbook =' + 'bank =' lines. ---
+        if not s.get("workbook"):
+            print("ERROR: give 'input_dir' (a folder) OR 'workbook' (a master .xlsx/.xlsm).",
+                  file=sys.stderr)
+            return 2
+        src = _resolve_path(base, s["workbook"])
+        # 'bank = <file> | <last-four> | <column>' lines; last-four is ignored
+        # here (statements are single-account), column defaults to Description.
+        bank_specs = []
+        for line in s.get("_banks", []):
+            parts = [p.strip() for p in line.split("|")]
+            f = _resolve_path(base, parts[0])
+            col = parts[2] if len(parts) > 2 and parts[2] else "Description"
+            bank_specs.append((f, col))
+
+    return run9_batch(src, config_path, seed, bank_specs, out, auto_seed=auto,
+                       amount_factor=amount_factor)
+
+
+def discover_inputs9(folder: Path, config_path: Path):
+    """Folder mode: find the one master workbook (.xlsx/.xlsm) and every bank CSV
+    in `folder` (top level only). Excludes the config CSV, Excel lock files
+    (~$...), and previously-produced *_anon.* outputs.
+    Returns (workbook, bank_specs, error_message-or-None)."""
+    if not folder.is_dir():
+        return None, [], f"input folder not found: {folder}"
+
+    def usable(p):
+        return (p.is_file() and not p.name.startswith("~$")
+                and not p.stem.endswith("_anon"))
+    cfg_resolved = config_path.resolve()
+
+    wbs = sorted(p for p in folder.iterdir()
+                 if usable(p) and p.suffix.lower() in (".xlsx", ".xlsm"))
+    if not wbs:
+        return None, [], f"no .xlsx/.xlsm workbook found in {folder}"
+    if len(wbs) > 1:
+        names = ", ".join(p.name for p in wbs)
+        return None, [], (f"{len(wbs)} workbooks found in {folder} ({names}); "
+                          f"keep one, or add a 'workbook =' line to pick it.")
+
+    banks = sorted(p for p in folder.iterdir()
+                   if usable(p) and p.suffix.lower() == ".csv"
+                   and p.resolve() != cfg_resolved)
+    return wbs[0], [(p, "Description") for p in banks], None
+
+
 def build_replacer9(mapping: dict):
     """Combined case-insensitive replacer for the Draft 9 mapping. Group order is
     most-specific first (street phrases and account numbers before names, codes
@@ -2284,20 +2704,32 @@ def build_replacer9(mapping: dict):
     town_map = dict(mapping["towns"])
     prop_map = dict(mapping["property_codes"])              # lower-keyed
     ent_map = {k.lower(): v for k, v in mapping["entity_codes"].items()}
+    llcprop_map = dict(mapping.get("llc_property_names", {}))  # already lower-keyed
     last4_map = dict(mapping["last_four"])
     acctnum_map = {}
     for a in mapping["accounts"]:
         for form in a["real_forms"]:
-            if any(not c.isdigit() for c in form):          # xxxx#### form
+            # Only MIXED letter+digit forms ('xxxx7352') go in the global
+            # blanket map - that shape essentially never collides with
+            # ordinary text. Pure-digit forms ('7352') are handled by the
+            # separate 'last4' bare-token group below. A purely alphabetic
+            # account identifier (e.g. 'cash', 'PP' - no real bank number,
+            # so acct_key() fell back to the raw text) is NOT safe to
+            # blanket-match anywhere in the workbook: 'cash' is also an
+            # ordinary word (e.g. the card name 'Blue Cash Everyday'). Those
+            # are excluded here and handled by apply_workbook9 instead,
+            # scoped to that account's own Account/Account # cells only.
+            if any(c.isalpha() for c in form) and any(c.isdigit() for c in form):
                 acctnum_map[form.lower()] = a["fake_number"]
 
     parts = []
-    def grp(gname, literals, pre=r"(?<!\w)", post=r"(?!\w)"):
+    def grp(gname, literals, pre=WORDISH_PRE, post=WORDISH_POST):
         body = _alt(literals)
         if body:
             parts.append(rf"(?P<{gname}>{pre}{body}{post})")
     grp("street", list(street_map))
     grp("acctnum", list(acctnum_map))
+    grp("llcprop", list(llcprop_map))         # before 'name': whole compound wins
     grp("name", list(name_map))
     grp("town", list(town_map))
     grp("propcode", list(prop_map), pre=r"(?<![A-Za-z0-9])", post=r"(?![A-Za-z0-9])")
@@ -2319,6 +2751,8 @@ def build_replacer9(mapping: dict):
             out = street_map[low]
         elif kind == "acctnum":
             out = acctnum_map[low]
+        elif kind == "llcprop":
+            out = llcprop_map[low]
         elif kind == "name":
             out = name_map[low]
         elif kind == "town":
@@ -2365,13 +2799,106 @@ def serialize_cell(v) -> str:
     return str(v)
 
 
-def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path):
-    """Anonymize every visible data tab and write one tab-delimited .txt each to
-    out_dir. Only text cells are replaced; numbers/dates pass through by type."""
+def build_filename_replacer9(mapping: dict):
+    """Filename-only replacer: swaps in the SAME known real values as
+    build_replacer9 (names, towns, account numbers/last-four, property/entity
+    codes), but skips its two blanket free-text heuristics - the 5+ digit run
+    scrub and the generic mixed alnum 'reference code' scramble. Those exist
+    for description/notes text; applied to a filename they can nuke an
+    ordinary name that just happens to mix in a few digits (e.g. a workbook
+    named '2025MRBusinessOnly' would otherwise be scrambled into gibberish
+    even though it contains no real identifier at all).
+
+    The last-four boundary is relaxed to digit-only (not alnum), so a real
+    account number glued directly onto letters (e.g. 'Chase7352_Activity...')
+    is still caught - that gluing is exactly how export tools name these
+    files, and is the actual leak this exists to close."""
+    street_map = {r.lower(): f for r, f in mapping["streets"].items()}
+    name_map = dict(mapping["names"])
+    town_map = dict(mapping["towns"])
+    prop_map = dict(mapping["property_codes"])
+    ent_map = {k.lower(): v for k, v in mapping["entity_codes"].items()}
+    last4_map = dict(mapping["last_four"])
+    acctnum_map = {}
+    for a in mapping["accounts"]:
+        for form in a["real_forms"]:
+            if any(not c.isdigit() for c in form):
+                acctnum_map[form.lower()] = a["fake_number"]
+
+    parts = []
+
+    def grp(gname, literals, pre=WORDISH_PRE, post=WORDISH_POST):
+        body = _alt(literals)
+        if body:
+            parts.append(rf"(?P<{gname}>{pre}{body}{post})")
+    grp("street", list(street_map))
+    grp("acctnum", list(acctnum_map))
+    grp("name", list(name_map))
+    grp("town", list(town_map))
+    grp("propcode", list(prop_map), pre=r"(?<![A-Za-z0-9])", post=r"(?![A-Za-z0-9])")
+    grp("entcode", list(ent_map), pre=r"(?<![A-Za-z0-9])", post=r"(?![A-Za-z0-9])")
+    if last4_map:
+        l4 = "(?:" + "|".join(re.escape(k) for k in sorted(last4_map)) + ")"
+        parts.append(rf"(?P<last4>(?<!\d){l4}(?!\d))")
+    if not parts:
+        return None, None
+
+    pattern = re.compile("|".join(parts), re.IGNORECASE)
+    maps = {"street": street_map, "acctnum": acctnum_map, "name": name_map,
+            "town": town_map, "propcode": prop_map, "entcode": ent_map,
+            "last4": last4_map}
+
+    def repl(m):
+        kind = m.lastgroup
+        text = m.group()
+        return maps[kind].get(text.lower(), text) if kind != "last4" \
+            else maps[kind].get(text, text)
+
+    return pattern, repl
+
+
+def anonymize_filename_stem(stem: str, mapping: dict) -> str:
+    """Anonymize a file NAME using the SAME known real values as cell text
+    (see build_filename_replacer9) - export filenames sometimes carry the
+    real account number (e.g. 'Chase7352_Activity_20260725'), so the output
+    file must not leak it even though the file's own content is already
+    clean. Then keep it a valid Windows filename."""
+    pattern, repl = build_filename_replacer9(mapping)
+    out = pattern.sub(repl, stem) if pattern else stem
+    return re.sub(r'[<>:"/\\|?*]', "_", out)
+
+
+def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path, amount_factor: float = 1.0):
+    """Anonymize every visible data tab and write ONE plain .xlsx workbook (one
+    sheet per tab, no styling). Text cells are replaced; numbers/dates are kept
+    as native Excel types so amounts stay numeric and Excel parses it cleanly.
+    If amount_factor != 1.0, every 'Amount' cell is also scaled by that
+    constant factor (rounded to the cent) - an OPT-IN departure from the
+    default 'books tie to the cent' rule, for extra obfuscation on request."""
     pattern, repl, stats = build_replacer9(mapping)
     addr_map = mapping.get("addresses", {})
+    # Some sheets (e.g. RulesN) store a bare account number ('585') as a real
+    # Excel INTEGER rather than text, unlike the 'xxxx0585' masked form which
+    # is always text. Numeric cells skip the text regex entirely, so those
+    # bare numbers were passing through un-anonymized. Look them up by the
+    # same account key used everywhere else and substitute the fake bare
+    # number, keeping the cell numeric (matches the source's own formatting).
+    key_to_fake4 = {a["key"]: a["fake_last4"] for a in mapping.get("accounts", [])}
+    # Word-based account identifiers ('cash', 'PP' - no real bank number, so
+    # acct_key() fell back to the raw text) are deliberately excluded from
+    # build_replacer9's global blanket match (see there for why: 'cash' is
+    # also an ordinary word elsewhere, e.g. 'Blue Cash Everyday'). They're
+    # still real account identifiers though, so substitute them here, scoped
+    # to ONLY the Account/Account # cells of their own row.
+    word_acctnum_map = {}
+    for a in mapping.get("accounts", []):
+        for form in a["real_forms"]:
+            if not any(c.isdigit() for c in form):
+                word_acctnum_map[form.lower()] = a["fake_number"]
     wb = openpyxl.load_workbook(wb_path, read_only=True, data_only=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_wb = openpyxl.Workbook()
+    out_wb.remove(out_wb.active)                      # start empty; add tabs below
     written = []
     for ws in wb.worksheets:
         if ws.sheet_state != "visible":
@@ -2383,7 +2910,14 @@ def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path):
             continue
         header = [_clean(v).lower() for v in row1[:width]]
         addr_i = header.index("address") if "address" in header else -1
-        out_rows = [[serialize_cell(v) for v in row1[:width]]]
+        acctnum_i = header.index("account #") if "account #" in header else -1
+        acct_i = header.index("account") if "account" in header else -1
+        inst_i = header.index("institution") if "institution" in header else -1
+        amt_i = header.index("amount") if "amount" in header else -1
+        # Excel sheet titles: max 31 chars, none of  : \ / ? * [ ]
+        title = re.sub(r"[:\\/?*\[\]]", "_", ws.title)[:31] or "Sheet"
+        out_ws = out_wb.create_sheet(title)
+        out_ws.append(list(row1[:width]))
         n = 0
         for r in it:
             cells = list(r)[:width]
@@ -2391,22 +2925,42 @@ def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path):
                 continue
             row = []
             for ci, v in enumerate(cells):
-                if not isinstance(v, str):
-                    row.append(serialize_cell(v))
+                if ci == acctnum_i and isinstance(v, (int, float)) and not isinstance(v, bool):
+                    fake4 = key_to_fake4.get(acct_key(str(v)))
+                    row.append(int(fake4) if fake4 is not None else v)
+                elif (ci == amt_i and amount_factor != 1.0
+                      and isinstance(v, (int, float)) and not isinstance(v, bool)):
+                    row.append(round(v * amount_factor, 2))
+                elif not isinstance(v, str):
+                    row.append(v)                    # int/float/datetime/None: native
+                elif ci in (acct_i, acctnum_i) and v.strip().lower() in word_acctnum_map:
+                    # Word-based account identifier ('cash', 'PP') - substitute
+                    # directly, scoped to just this cell (see word_acctnum_map).
+                    row.append(word_acctnum_map[v.strip().lower()])
+                elif ci == inst_i:
+                    # Institutions (e.g. 'Chase') are left as-is by design.
+                    # Without this carve-out, an account whose Account #/Account
+                    # is a plain word rather than a real number (e.g. a 'cash'
+                    # pseudo-account with Account = Account # = Institution =
+                    # 'cash') would have its Institution cell corrupted too,
+                    # since the same literal text is also a harvested account
+                    # identifier and gets swapped everywhere it appears.
+                    row.append(v)
                 elif ci == addr_i:
                     # Address cell: use the address mapping (keeps state/ZIP);
                     # fall back to the regex if this exact address wasn't harvested.
                     row.append(addr_map.get(v) or pattern.sub(repl, v))
                 else:
                     row.append(pattern.sub(repl, v))
-            out_rows.append(row)
+            out_ws.append(row)
             n += 1
-        out_path = out_dir / f"{ws.title}.txt"
-        with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
-            csv.writer(f, delimiter="\t").writerows(out_rows)
-        written.append((ws.title, out_path, n))
+        written.append((title, n))
     wb.close()
-    return written, stats
+    safe_stem = anonymize_filename_stem(wb_path.stem, mapping)
+    out_path = out_dir / f"{safe_stem}_anon.xlsx"
+    out_wb.save(out_path)
+    out_wb.close()
+    return written, out_path, stats
 
 
 def cmd_apply9(args) -> int:
@@ -2428,11 +2982,12 @@ def cmd_apply9(args) -> int:
         f.write("\n")
 
     out_dir = (args.out or (src.parent / "output")) / str(args.seed)
-    written, stats = apply_workbook9(src, mapping, out_dir)
+    written, wb_out, stats = apply_workbook9(src, mapping, out_dir)
 
     print(f"\n  output folder: {out_dir}")
-    for title, path, n in written:
-        print(f"    {title}.txt: {n} data rows")
+    print(f"    {wb_out.name}  ({len(written)} tabs)")
+    for title, n in written:
+        print(f"      - {title}: {n} data rows")
     print("  replacements by rule:")
     for k in ("street", "acctnum", "name", "town", "propcode", "entcode", "last4", "run", "alcode"):
         if k in stats:
@@ -2464,11 +3019,14 @@ def scan_blacklist9(out_dir: Path, terms):
     """Case-insensitive, whitespace-trimmed WHOLE-WORD scan of every output file
     (word boundaries avoid false positives like 'Amira' for the root 'Amir').
     Returns leaks [(file, term, context)]."""
-    pats = [(t.strip(), re.compile(r"(?<!\w)" + re.escape(t.strip()) + r"(?!\w)", re.IGNORECASE))
+    pats = [(t.strip(), re.compile(WORDISH_PRE + re.escape(t.strip()) + WORDISH_POST, re.IGNORECASE))
             for t in terms if t.strip()]
     leaks = []
-    for f in sorted(out_dir.glob("*.txt")):
-        text = f.read_text(encoding="utf-8-sig", errors="replace")
+    files = sorted(list(out_dir.glob("*.txt")) + list(out_dir.glob("*.csv"))
+                   + list(out_dir.glob("*.xlsx")))
+    for f in files:
+        text = _workbook_text(f) if f.suffix.lower() == ".xlsx" \
+            else f.read_text(encoding="utf-8-sig", errors="replace")
         for tt, rx in pats:
             m = rx.search(text)
             if m:
@@ -2671,6 +3229,26 @@ def main(argv=None) -> int:
     s9.add_argument("-o", "--out", type=Path, default=None,
                     help="Output base folder (default: <workbook dir>/output)")
     s9.set_defaults(func=cmd_scan9)
+
+    r9 = sub.add_parser("run9",
+                        help="Draft 9 increment 7: one command -> workbook + bank CSVs + checks + report.")
+    r9.add_argument("workbook", type=Path, help="Master Excel workbook (.xlsx/.xlsm)")
+    r9.add_argument("-c", "--config", type=Path, required=True,
+                    help="Config CSV (Names/Towns/Blacklist)")
+    r9.add_argument("--seed", required=True, help="Seed (names the output subfolder + mapping)")
+    r9.add_argument("--banks", nargs="*", default=[],
+                    help="Zero or more bank statement CSV paths to anonymize with the same mapping")
+    r9.add_argument("-o", "--out", type=Path, default=None,
+                    help="Output base folder (default: <workbook dir>/output)")
+    r9.add_argument("--amount-factor", type=float, default=1.0,
+                    help="Scale every dollar amount by this factor, 0.80-1.20 (default 1.0 = off)")
+    r9.set_defaults(func=cmd_run9)
+
+    fc9 = sub.add_parser("fromconfig9",
+                         help="Draft 9 increment 7: run everything from run9.config.txt (double-click).")
+    fc9.add_argument("-f", "--file", type=Path, default=None,
+                     help="Settings file (default: run9.config.txt next to anonymizer.py)")
+    fc9.set_defaults(func=cmd_fromconfig9)
 
     args = p.parse_args(argv)
     return args.func(args)
