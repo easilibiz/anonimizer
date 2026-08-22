@@ -25,6 +25,9 @@ from pathlib import Path
 
 import openpyxl
 
+# Bumped on every commit going forward (also tagged in git as vN).
+VERSION = "12"
+
 # The three text columns rewritten by the regex pass (spec / CLAUDE.md).
 TARGET_COLUMNS = ["Description", "Account", "Account #"]
 # Institution: NOT faked, but normalized per account # so the trio stays
@@ -2428,6 +2431,20 @@ def build_mapping9(harvest: dict, config: dict, pools: dict, seed) -> dict:
         used.add(candidate)
         llc_property_names[low] = candidate
 
+    # An owner root that owns a specific property (e.g. 'Motia' -> 'Motia
+    # LLC' -> '301 Brook St LLC') gets its NAME itself overridden to match,
+    # not just the exact 'Motia LLC' compound - otherwise 'Motia CK' would
+    # still show the old owner-name fake ('Mark CK') while 'Motia LLC' shows
+    # the property-derived one, inconsistent. Every suffixed form (bare, CK,
+    # Bus, ...) shares this one root, so overriding it here covers all of
+    # them at once, e.g. 'Motia CK' -> '301 Brook St LLC CK'. This WINS over
+    # whatever the config-driven name section assigned that root.
+    for full_llc, fake_llc in llc_property_names.items():
+        root, _suffix = split_core(full_llc)
+        root_key = " ".join(root).lower()
+        if root_key:
+            names[root_key] = fake_llc
+
     return {
         "seed": seed, "names": names, "towns": towns, "accounts": accounts,
         "last_four": last_four, "entity_codes": entity_codes,
@@ -2521,7 +2538,7 @@ def run9_batch(src: Path, config_path: Path, seed: str, bank_specs, out: Path = 
         return 2
 
     print("=" * 64)
-    print("ANONYMIZER RUN (Draft 9 - workbook + bank CSVs)")
+    print(f"ANONYMIZER RUN v{VERSION} (Draft 9 - workbook + bank CSVs)")
     print("=" * 64)
     print(f"  workbook: {src}")
     print(f"  banks:    {[p.name for p, _c in bank_specs] or '(none)'}")
@@ -2722,6 +2739,28 @@ def build_replacer9(mapping: dict):
             if any(c.isalpha() for c in form) and any(c.isdigit() for c in form):
                 acctnum_map[form.lower()] = a["fake_number"]
 
+    # Two names glued with NO separator at all (e.g. 'ofirtali' = 'ofir' +
+    # 'tali') can't be caught by any whole-word boundary rule - there is no
+    # character marking where one name ends and the next begins. Detect it
+    # instead by checking whether the WHOLE word is exactly the
+    # concatenation of two known single-word config Names, and replace it
+    # with their two fakes glued the same way. Each half must be >=3 chars
+    # (skips noise from very short entries like 'MR'); longest-prefix-first
+    # avoids preferring a spurious short split when a longer one also fits.
+    single_names = {k: v for k, v in name_map.items() if " " not in k}
+    single_names_by_len = sorted(single_names, key=len, reverse=True)
+
+    def find_glued_pair(word_low):
+        if word_low in single_names:
+            return None                   # already one whole known name
+        for first in single_names_by_len:
+            if len(first) < 3 or not word_low.startswith(first):
+                continue
+            second = word_low[len(first):]
+            if len(second) >= 3 and second in single_names:
+                return first, second
+        return None
+
     parts = []
     def grp(gname, literals, pre=WORDISH_PRE, post=WORDISH_POST):
         body = _alt(literals)
@@ -2737,6 +2776,11 @@ def build_replacer9(mapping: dict):
     if last4_map:
         l4 = "(?:" + "|".join(re.escape(k) for k in sorted(last4_map)) + ")"
         parts.append(rf"(?P<last4>(?<![A-Za-z0-9]){l4}(?![A-Za-z0-9]))")
+    if single_names:
+        # Letters-only run, tried before 'alcode' (which would otherwise
+        # structurally claim the same span, always as a no-op for pure
+        # letters, and never let 'gluedpair' see it).
+        parts.append(rf"(?P<gluedpair>{WORDISH_PRE}[A-Za-z]{{4,}}{WORDISH_POST})")
     parts.append(r"(?P<run>(?<![A-Za-z0-9])\d{5,}(?![A-Za-z0-9]))")
     parts.append(r"(?P<alcode>(?<![A-Za-z0-9])[A-Za-z0-9]{5,}(?![A-Za-z0-9]))")
     pattern = re.compile("|".join(parts), re.IGNORECASE)
@@ -2763,6 +2807,12 @@ def build_replacer9(mapping: dict):
             out = ent_map[low]
         elif kind == "last4":
             out = last4_map.get(text, text)
+        elif kind == "gluedpair":
+            pair = find_glued_pair(low)
+            if pair:
+                out = single_names[pair[0]] + single_names[pair[1]]
+            else:
+                out, kind = text, "gluedpair_skip"
         elif kind == "run":
             rr = random.Random(f"{seed}|run|{text}")
             out = "".join(str(rr.randrange(10)) for _ in text)
