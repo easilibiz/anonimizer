@@ -26,7 +26,7 @@ from pathlib import Path
 import openpyxl
 
 # Bumped on every commit going forward (also tagged in git as vN).
-VERSION = "12"
+VERSION = "13"
 
 # The three text columns rewritten by the regex pass (spec / CLAUDE.md).
 TARGET_COLUMNS = ["Description", "Account", "Account #"]
@@ -3156,6 +3156,7 @@ def cmd_wbinspect(args) -> int:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Anonymizer (incremental build).")
+    p.add_argument("--version", action="version", version=f"anonymizer v{VERSION}")
     sub = p.add_subparsers(dest="command", required=True)
 
     rt = sub.add_parser("roundtrip", help="Increment 1: no-op round-trip gate.")
@@ -3301,6 +3302,7 @@ def main(argv=None) -> int:
     fc9.set_defaults(func=cmd_fromconfig9)
 
     args = p.parse_args(argv)
+    print(f"anonymizer v{VERSION}")
     return args.func(args)
 
 
