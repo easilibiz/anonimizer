@@ -26,7 +26,7 @@ from pathlib import Path
 import openpyxl
 
 # Bumped on every commit going forward (also tagged in git as vN).
-VERSION = "14"
+VERSION = "15"
 
 # The three text columns rewritten by the regex pass (spec / CLAUDE.md).
 TARGET_COLUMNS = ["Description", "Account", "Account #"]
@@ -1748,6 +1748,23 @@ MONEY_RE = re.compile(r"^\(?-?\$?[\d,]+\.\d{2}\)?$")
 
 AMOUNT_COLUMN_NAMES = {"amount", "running bal.", "running balance", "balance", "summary amt."}
 
+# Keyword-based dollar-column detector for Excel tabs, whose column names
+# vary far more than a bank export's fixed 'Amount'/'Running Bal.' (e.g. the
+# opening_property/opening_cash tabs use 'Building', 'Land', 'Mortgage
+# balance', 'Security deposits', 'Opening cash' - none of which match a
+# single hardcoded 'amount' column check). Matched as a substring so new
+# tabs with yet another dollar-column name are covered without a code
+# change, while non-monetary numeric columns (Seq, rule, Cnt, Account #)
+# don't match any of these words.
+MONEY_COLUMN_KEYWORDS = ("amount", "balance", "deposit", "building", "land",
+                          "depreciation", "mortgage", "cash", "rent", "value",
+                          "price", "cost", "fee", "income", "expense")
+
+
+def is_money_column(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in MONEY_COLUMN_KEYWORDS)
+
 
 def parse_money(text: str):
     """Parse a plain currency string ('24,120.66', '-113,871.10', '(45.02)')
@@ -2966,9 +2983,10 @@ def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path, amount_factor: 
     """Anonymize every visible data tab and write ONE plain .xlsx workbook (one
     sheet per tab, no styling). Text cells are replaced; numbers/dates are kept
     as native Excel types so amounts stay numeric and Excel parses it cleanly.
-    If amount_factor != 1.0, every 'Amount' cell is also scaled by that
-    constant factor (rounded to the cent) - an OPT-IN departure from the
-    default 'books tie to the cent' rule, for extra obfuscation on request."""
+    If amount_factor != 1.0, every dollar-column cell (see is_money_column)
+    is also scaled by that constant factor (rounded to the cent) - an
+    OPT-IN departure from the default 'books tie to the cent' rule, for
+    extra obfuscation on request."""
     pattern, repl, stats = build_replacer9(mapping)
     addr_map = mapping.get("addresses", {})
     # Some sheets (e.g. RulesN) store a bare account number ('585') as a real
@@ -3010,7 +3028,7 @@ def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path, amount_factor: 
         acctnum_i = header.index("account #") if "account #" in header else -1
         acct_i = header.index("account") if "account" in header else -1
         inst_i = header.index("institution") if "institution" in header else -1
-        amt_i = header.index("amount") if "amount" in header else -1
+        money_is = {i for i, h in enumerate(header) if is_money_column(h)}
         # Excel sheet titles: max 31 chars, none of  : \ / ? * [ ]
         title = re.sub(r"[:\\/?*\[\]]", "_", ws.title)[:31] or "Sheet"
         out_ws = out_wb.create_sheet(title)
@@ -3032,7 +3050,7 @@ def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path, amount_factor: 
                 if ci == acctnum_i and isinstance(v, (int, float)) and not isinstance(v, bool):
                     fake4 = key_to_fake4.get(acct_key(str(v)))
                     row.append(int(fake4) if fake4 is not None else v)
-                elif (ci == amt_i and amount_factor != 1.0
+                elif (ci in money_is and amount_factor != 1.0
                       and isinstance(v, (int, float)) and not isinstance(v, bool)):
                     row.append(round(v * amount_factor, 2))
                 elif not isinstance(v, str):
