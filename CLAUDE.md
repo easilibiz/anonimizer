@@ -3,6 +3,8 @@
 Turns the founder's real bookkeeping data into a shareable, anonymized twin.
 Full requirements: see `Anonymization_Spec_Draft_10.docx` in this repo. Read it before writing code.
 
+**Standing authorization:** after every commit to this repo, push to `origin main` (and any new tag) immediately, without asking first. The founder gave this instruction explicitly and wants it applied every time going forward — don't re-ask.
+
 ## Settled decisions — do NOT relitigate
 - **Language:** Python 3. Read Excel with **openpyxl** (read-only; never rewrite the .xlsx). Read/write CSVs and TSVs with the `csv` module.
 - **Input = one folder** (e.g. `PersonalData/`): the master Excel workbook + ~a dozen raw bank CSVs. Everything in the folder is anonymized in ONE run under ONE seed and ONE shared mapping, so all files stay mutually synchronized.

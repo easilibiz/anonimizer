@@ -26,7 +26,7 @@ from pathlib import Path
 import openpyxl
 
 # Bumped on every commit going forward (also tagged in git as vN).
-VERSION = "15"
+VERSION = "16"
 
 # The three text columns rewritten by the regex pass (spec / CLAUDE.md).
 TARGET_COLUMNS = ["Description", "Account", "Account #"]
