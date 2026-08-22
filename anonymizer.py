@@ -26,7 +26,7 @@ from pathlib import Path
 import openpyxl
 
 # Bumped on every commit going forward (also tagged in git as vN).
-VERSION = "13"
+VERSION = "14"
 
 # The three text columns rewritten by the regex pass (spec / CLAUDE.md).
 TARGET_COLUMNS = ["Description", "Account", "Account #"]
@@ -2918,6 +2918,50 @@ def anonymize_filename_stem(stem: str, mapping: dict) -> str:
     return re.sub(r'[<>:"/\\|?*]', "_", out)
 
 
+DATE_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$|^\d{1,2}/\d{1,2}/\d{2,4}$")
+
+
+def _looks_like_header_row(row) -> bool:
+    """A header's cells are short column labels - reject a row holding a
+    long sentence (instructions text) or a literal date value ('as of:'
+    rows), which a plain width/density check alone can't tell apart from a
+    real header that happens to have a trailing blank column."""
+    cells = [c for c in row if c is not None and str(c).strip() != ""]
+    if not cells:
+        return False
+    for c in cells:
+        s = str(c).strip()
+        if len(s) > 40 or len(s.split()) > 6 or DATE_LIKE_RE.match(s):
+            return False
+    return True
+
+
+def find_header_row_excel(rows, max_scan: int = 30) -> int:
+    """Find the real column-header row among a sheet's first `max_scan` rows.
+
+    Some tabs (e.g. 'opening_property') lead with a multi-line title/
+    instructions preamble before the real header ('Opening property book
+    values' / a long instructions sentence / an 'as of' date row / a blank
+    row / THEN the header). Naively treating row 1 as the header clamps the
+    whole sheet to that title row's width (often just 1 non-empty cell),
+    silently dropping every data column beyond the first.
+
+    Picks the FIRST header-shaped row (see _looks_like_header_row) with the
+    widest extent: a real header has every column labeled, reaching the
+    sheet's true width - the max any row can reach - even if a middle
+    column happens to be blank. A data row can tie that width but never
+    beat it, and ties go to the earlier row, so an already-correct row-1
+    header (the common case) is never displaced."""
+    best_i, best_w = 0, -1
+    for i, row in enumerate(rows[:max_scan]):
+        if not _looks_like_header_row(row):
+            continue
+        w = used_width(row)
+        if w > best_w:
+            best_i, best_w = i, w
+    return best_i
+
+
 def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path, amount_factor: float = 1.0):
     """Anonymize every visible data tab and write ONE plain .xlsx workbook (one
     sheet per tab, no styling). Text cells are replaced; numbers/dates are kept
@@ -2953,8 +2997,11 @@ def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path, amount_factor: 
     for ws in wb.worksheets:
         if ws.sheet_state != "visible":
             continue
-        it = ws.iter_rows(values_only=True)
-        row1 = list(next(it, ()) or [])
+        all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        if not all_rows:
+            continue
+        hidx = find_header_row_excel(all_rows)
+        row1 = all_rows[hidx]
         width = used_width(row1)
         if width == 0:
             continue
@@ -2967,9 +3014,16 @@ def apply_workbook9(wb_path: Path, mapping: dict, out_dir: Path, amount_factor: 
         # Excel sheet titles: max 31 chars, none of  : \ / ? * [ ]
         title = re.sub(r"[:\\/?*\[\]]", "_", ws.title)[:31] or "Sheet"
         out_ws = out_wb.create_sheet(title)
+        # Any preamble rows before the real header (title/instructions) are
+        # passed through - text-anonymized, but at their OWN natural width,
+        # not clamped to the header's width (they aren't tabular data).
+        for prow in all_rows[:hidx]:
+            pwidth = used_width(prow)
+            out_ws.append([pattern.sub(repl, v) if isinstance(v, str) else v
+                           for v in prow[:pwidth]])
         out_ws.append(list(row1[:width]))
         n = 0
-        for r in it:
+        for r in all_rows[hidx + 1:]:
             cells = list(r)[:width]
             if not any(c is not None and str(c).strip() for c in cells):
                 continue
